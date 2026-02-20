@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Project specific
+*.log
+
+# Books (copyrighted content - not for distribution)
+books/
+
+# User-specific MCP config (contains local paths)
+.mcp.json
+
+# Claude Code user config
+.claude/
+
+# UV lock (let users resolve their own deps)
+uv.lock

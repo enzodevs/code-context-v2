@@ -1,0 +1,1290 @@
+#!/usr/bin/env python3
+"""Interactive management CLI for Code Context using gum TUI.
+
+Run with: uv run python cli/manage.py
+Requires: gum (https://github.com/charmbracelet/gum)
+"""
+
+import asyncio
+import subprocess
+import sys
+from pathlib import Path
+
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+
+def gum_available() -> bool:
+    """Check if gum is installed."""
+    try:
+        subprocess.run(["gum", "--version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def gum_style(text: str, **kwargs) -> str:
+    """Style text with gum."""
+    args = ["gum", "style"]
+    for key, value in kwargs.items():
+        if isinstance(value, bool):
+            if value:
+                args.append(f"--{key.replace('_', '-')}")
+        else:
+            args.extend([f"--{key.replace('_', '-')}", str(value)])
+    args.append("--")
+    args.append(text)
+    result = subprocess.run(args, capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else text
+
+
+def gum_choose(options: list[str], header: str = "") -> str | None:
+    """Show selection menu with gum."""
+    if header:
+        print(gum_style(header, bold=True, foreground="212"))
+
+    # Escape options for shell
+    escaped_options = " ".join(f'"{opt}"' for opt in options)
+
+    # Use shell to ensure proper TTY handling
+    result = subprocess.run(
+        f'gum choose --cursor.foreground=212 {escaped_options}',
+        shell=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def gum_filter(options: list[str], header: str = "", placeholder: str = "Type to filter...") -> str | None:
+    """Show filterable list with gum.
+
+    For small lists (<15 items), falls back to gum choose for better TTY handling.
+    For larger lists, uses printf piping for safe handling.
+    """
+    if header:
+        print(gum_style(header, bold=True, foreground="212"))
+
+    # For small lists, use gum choose (more reliable TTY handling)
+    if len(options) <= 15:
+        return gum_choose(options)
+
+    # For larger lists, use printf with %s for safe handling of special chars
+    escaped_placeholder = placeholder.replace('"', '\\"')
+    # Use printf with explicit newlines for each option
+    printf_args = "\\n".join(opt.replace("\\", "\\\\").replace('"', '\\"') for opt in options)
+    result = subprocess.run(
+        f'printf "%s\\n" "{printf_args}" | gum filter --placeholder "{escaped_placeholder}" --indicator.foreground=212',
+        shell=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def gum_confirm(prompt: str) -> bool:
+    """Show confirmation prompt with gum."""
+    # Escape prompt for shell
+    escaped_prompt = prompt.replace('"', '\\"')
+    result = subprocess.run(
+        f'gum confirm "{escaped_prompt}" --affirmative=Yes --negative=No',
+        shell=True,
+    )
+    return result.returncode == 0
+
+
+def gum_input(placeholder: str = "", header: str = "") -> str | None:
+    """Get text input with gum."""
+    if header:
+        print(gum_style(header, bold=True, foreground="212"))
+    escaped_placeholder = placeholder.replace('"', '\\"')
+    result = subprocess.run(
+        f'gum input --placeholder "{escaped_placeholder}" --cursor.foreground=212',
+        shell=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def gum_spin(title: str, command: list[str]) -> subprocess.CompletedProcess:
+    """Run command with spinner."""
+    return subprocess.run(
+        ["gum", "spin", "--spinner", "dot", "--title", title, "--show-output", "--"] + command,
+        capture_output=True,
+        text=True,
+    )
+
+
+def print_header():
+    """Print CLI header."""
+    header = gum_style(
+        "  Code Context Manager  ",
+        bold=True,
+        foreground="212",
+        border="rounded",
+        padding="1 2",
+    )
+    print(header)
+    print()
+
+
+def print_success(message: str):
+    """Print success message."""
+    print(gum_style(f"✓ {message}", foreground="10"))
+
+
+def print_error(message: str):
+    """Print error message."""
+    print(gum_style(f"✗ {message}", foreground="9"))
+
+
+def print_info(message: str):
+    """Print info message."""
+    print(gum_style(f"→ {message}", foreground="14"))
+
+
+def print_warning(message: str):
+    """Print warning message."""
+    print(gum_style(f"⚠ {message}", foreground="11"))
+
+
+async def list_projects():
+    """List all indexed projects."""
+    from code_context.db.pool import DatabasePool
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+
+        if not projects:
+            print_warning("No projects indexed yet.")
+            print_info("Use 'Index new project' to add one.")
+            return
+
+        print(gum_style("Indexed Projects", bold=True, foreground="212"))
+        print()
+
+        for p in projects:
+            langs = ", ".join(p["languages"]) if p["languages"] else "unknown"
+            last = p["last_indexed"].strftime("%Y-%m-%d %H:%M") if p["last_indexed"] else "never"
+
+            print(f"  {gum_style(p['project_id'], bold=True, foreground='212')} → {p['project_root']}")
+            print(f"    Files: {p['file_count']} | Chunks: {p['chunk_count']} | LOC: {p['total_loc']}")
+            print(f"    Languages: {langs}")
+            print(f"    Last indexed: {last}")
+            print()
+
+    finally:
+        await db.close()
+
+
+async def view_project_stats():
+    """View detailed stats for a specific project."""
+    from code_context.db.pool import DatabasePool
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+
+        if not projects:
+            print_warning("No projects indexed yet.")
+            return
+
+        # Let user select a project by ID
+        options = [f"{p['project_id']} ({p['project_root']})" for p in projects]
+        selected = gum_filter(options, header="Select project to view stats:", placeholder="Type to filter...")
+
+        if not selected:
+            print_info("Cancelled.")
+            return
+
+        # Extract project_id from selection
+        project_id = selected.split(" (")[0]
+        stats = await db.get_project_stats(project_id)
+
+        if not stats:
+            print_error(f"Project not found: {project_id}")
+            return
+
+        print()
+        print(gum_style(f"Stats for: {stats['project_id']}", bold=True, foreground="212"))
+        print(f"  Path: {stats['project_root']}")
+        print()
+        print(f"  Total files:  {stats['file_count']}")
+        print(f"  Total chunks: {stats['chunk_count']}")
+        print(f"  Total LOC:    {stats['total_loc']}")
+        if stats["last_indexed"]:
+            print(f"  Last indexed: {stats['last_indexed'].strftime('%Y-%m-%d %H:%M:%S')}")
+        print()
+
+        if stats["by_language"]:
+            print(gum_style("By Language:", bold=True))
+            for lang, data in stats["by_language"].items():
+                print(f"\n  {gum_style(lang, foreground='14')}:")
+                print(f"    Files:        {data['files']}")
+                print(f"    Chunks:       {data['chunks']}")
+                print(f"    ├─ file:        {data.get('files_chunks', 0)}")
+                print(f"    ├─ declaration: {data.get('declarations', 0)}")
+                print(f"    ├─ function:    {data['functions']}")
+                print(f"    ├─ class:       {data['classes']}")
+                print(f"    └─ method:      {data['methods']}")
+
+    finally:
+        await db.close()
+
+
+async def delete_project():
+    """Delete a specific project from the index."""
+    from code_context.db.pool import DatabasePool
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+
+        if not projects:
+            print_warning("No projects indexed yet.")
+            return
+
+        # Let user select a project by ID
+        options = [f"{p['project_id']} ({p['file_count']} files, {p['chunk_count']} chunks)" for p in projects]
+        selected = gum_filter(options, header="Select project to DELETE:", placeholder="Type to filter...")
+
+        if not selected:
+            print_info("Cancelled.")
+            return
+
+        # Extract project_id from selection
+        project_id = selected.split(" (")[0]
+
+        # Confirm deletion
+        print()
+        print_warning(f"This will delete ALL indexed data for project: {project_id}")
+
+        if not gum_confirm(f"Delete project '{project_id}'?"):
+            print_info("Cancelled.")
+            return
+
+        result = await db.delete_project(project_id)
+        print()
+        print_success(f"Deleted {result['deleted_files']} files and {result['deleted_chunks']} chunks")
+
+    finally:
+        await db.close()
+
+
+async def index_project():
+    """Index a new project."""
+    from code_context.db.pool import DatabasePool
+    from code_context.embedding.voyage import VoyageClient
+    from code_context.indexer import Indexer
+
+    # Step 1: Get project path
+    path_input = gum_input(
+        placeholder="/path/to/project",
+        header="📁 Project path:"
+    )
+
+    if not path_input:
+        print_info("Cancelled.")
+        return
+
+    # Expand ~ and resolve path
+    project_path = Path(path_input).expanduser().resolve()
+
+    if not project_path.is_dir():
+        print_error(f"Not a directory: {project_path}")
+        return
+
+    # Step 2: Get project ID (suggest basename as default)
+    default_id = project_path.name
+    print()
+    print(gum_style(f"Suggested ID: {default_id}", foreground="240"))
+
+    project_id = gum_input(
+        placeholder=default_id,
+        header="🏷️  Project ID (short name for searches):"
+    )
+
+    # Use default if empty
+    if not project_id:
+        project_id = default_id
+
+    # Validate project ID (no spaces, lowercase)
+    project_id = project_id.strip().lower().replace(" ", "-")
+
+    if not project_id:
+        print_error("Project ID cannot be empty")
+        return
+
+    # Step 3: Confirm before indexing
+    print()
+    print(gum_style("Summary:", bold=True))
+    print(f"  Path: {project_path}")
+    print(f"  ID:   {project_id}")
+    print()
+
+    if not gum_confirm("Proceed with indexing?"):
+        print_info("Cancelled.")
+        return
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        # Step 4: Check if project already exists, only ask force if it does
+        force = False
+        existing_projects = await db.list_projects()
+        project_exists = any(p["project_id"] == project_id for p in existing_projects)
+
+        if project_exists:
+            force = gum_confirm("Project already indexed. Force reindex all files (even unchanged)?")
+
+        print()
+        print_info(f"Indexing: {project_path} as '{project_id}'")
+        print_info("This may take a while for large projects...")
+        print()
+        voyage = VoyageClient()
+        indexer = Indexer(db, voyage)
+
+        stats = await indexer.index_project(
+            project_root=str(project_path),
+            project_id=project_id,
+            force=force,
+        )
+
+        print()
+        print_success(f"Indexed {stats['indexed_files']} files as '{project_id}'")
+        print_info(f"Total files scanned: {stats['total_files']}")
+        print_info(f"Files skipped (unchanged): {stats['skipped_files']}")
+        print_info(f"Total chunks created: {stats['total_chunks']}")
+
+        if stats["errors"]:
+            print()
+            print_warning(f"Errors: {len(stats['errors'])}")
+            for err in stats["errors"][:5]:
+                print(f"  - {err['file']}: {err['error']}")
+            if len(stats["errors"]) > 5:
+                print(f"  ... and {len(stats['errors']) - 5} more")
+
+    finally:
+        await db.close()
+
+
+async def sync_project():
+    """Sync an existing project (reindex only changed files)."""
+    from code_context.db.pool import DatabasePool
+    from code_context.embedding.voyage import VoyageClient
+    from code_context.indexer import Indexer
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+
+        if not projects:
+            print_warning("No projects indexed yet.")
+            print_info("Use 'Index new project' to add one first.")
+            return
+
+        # Let user select a project
+        options = []
+        for p in projects:
+            last = p["last_indexed"].strftime("%Y-%m-%d %H:%M") if p["last_indexed"] else "never"
+            options.append(f"{p['project_id']} | {p['file_count']} files | Last: {last}")
+
+        selected = gum_filter(options, header="Select project to sync:", placeholder="Type to filter...")
+
+        if not selected:
+            print_info("Cancelled.")
+            return
+
+        # Extract project_id from selection
+        project_id = selected.split(" | ")[0]
+        project = next((p for p in projects if p["project_id"] == project_id), None)
+
+        if not project:
+            print_error(f"Project not found: {project_id}")
+            return
+
+        project_path = project["project_root"]
+
+        print()
+        print_info(f"Syncing: {project_path}")
+        print_info("Checking for modified files...")
+        print()
+
+        voyage = VoyageClient()
+        indexer = Indexer(db, voyage)
+
+        stats = await indexer.index_project(
+            project_root=project_path,
+            project_id=project_id,
+            force=False,  # Only changed files
+        )
+
+        print()
+        deleted = stats.get("deleted_files", 0)
+        if stats["indexed_files"] == 0 and deleted == 0:
+            print_success("Already up to date! No changes detected.")
+        else:
+            parts = []
+            if stats["indexed_files"] > 0:
+                parts.append(f"{stats['indexed_files']} reindexed")
+            if deleted > 0:
+                parts.append(f"{deleted} removed")
+            print_success(f"Synced: {', '.join(parts)}")
+
+        print()
+        print(f"  📁 Files scanned:    {stats['total_files']}")
+        print(f"  ✏️  Files reindexed:  {stats['indexed_files']}")
+        print(f"  ⏭️  Files unchanged:  {stats['skipped_files']}")
+        if deleted > 0:
+            print(f"  🗑️  Files removed:   {deleted}")
+        print(f"  📦 Chunks created:   {stats['total_chunks']}")
+
+        if stats["errors"]:
+            print()
+            print_warning(f"Errors: {len(stats['errors'])}")
+            for err in stats["errors"][:5]:
+                print(f"  - {err['file']}: {err['error']}")
+            if len(stats["errors"]) > 5:
+                print(f"  ... and {len(stats['errors']) - 5} more")
+
+    finally:
+        await db.close()
+
+
+async def check_sync_status():
+    """Check if a project needs syncing (dry-run, no changes made)."""
+    from code_context.db.pool import DatabasePool
+    from code_context.indexer import Indexer
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+
+        if not projects:
+            print_warning("No projects indexed yet.")
+            return
+
+        # Let user select a project
+        options = []
+        for p in projects:
+            last = p["last_indexed"].strftime("%Y-%m-%d %H:%M") if p["last_indexed"] else "never"
+            options.append(f"{p['project_id']} | {p['file_count']} files | Last: {last}")
+
+        selected = gum_filter(options, header="Select project to check:", placeholder="Type to filter...")
+
+        if not selected:
+            print_info("Cancelled.")
+            return
+
+        project_id = selected.split(" | ")[0]
+        project = next((p for p in projects if p["project_id"] == project_id), None)
+
+        if not project:
+            print_error(f"Project not found: {project_id}")
+            return
+
+        project_path = project["project_root"]
+
+        print()
+        print_info(f"Checking: {project_path}")
+        print_info("Comparing disk vs index (no changes will be made)...")
+        print()
+
+        indexer = Indexer(db, None)  # No VoyageClient needed for check
+        status = await indexer.check_status(
+            project_root=project_path,
+            project_id=project_id,
+        )
+
+        _print_sync_status(status, project_path)
+
+    finally:
+        await db.close()
+
+
+def _print_sync_status(status: dict, project_path: str):
+    """Print sync status report."""
+    root = Path(project_path)
+
+    if status["up_to_date"]:
+        print_success("Up to date! No changes detected.")
+        print()
+        print(f"  Files on disk:  {status['total_on_disk']}")
+        print(f"  Files indexed:  {status['total_indexed']}")
+        return
+
+    print_warning("Out of sync! Changes detected:")
+    print()
+
+    if status["new"]:
+        print(gum_style(f"  + {len(status['new'])} new file(s):", foreground="10"))
+        for f in status["new"][:10]:
+            try:
+                rel = str(Path(f).relative_to(root))
+            except ValueError:
+                rel = f
+            print(f"    + {rel}")
+        if len(status["new"]) > 10:
+            print(f"    ... and {len(status['new']) - 10} more")
+        print()
+
+    if status["modified"]:
+        print(gum_style(f"  ~ {len(status['modified'])} modified file(s):", foreground="11"))
+        for f in status["modified"][:10]:
+            try:
+                rel = str(Path(f).relative_to(root))
+            except ValueError:
+                rel = f
+            print(f"    ~ {rel}")
+        if len(status["modified"]) > 10:
+            print(f"    ... and {len(status['modified']) - 10} more")
+        print()
+
+    if status["deleted"]:
+        print(gum_style(f"  - {len(status['deleted'])} deleted file(s):", foreground="9"))
+        for f in status["deleted"][:10]:
+            try:
+                rel = str(Path(f).relative_to(root))
+            except ValueError:
+                rel = f
+            print(f"    - {rel}")
+        if len(status["deleted"]) > 10:
+            print(f"    ... and {len(status['deleted']) - 10} more")
+        print()
+
+    print(f"  Files on disk:    {status['total_on_disk']}")
+    print(f"  Files indexed:    {status['total_indexed']}")
+    print(f"  Unchanged:        {len(status['unchanged'])}")
+    total_changes = len(status["new"]) + len(status["modified"]) + len(status["deleted"])
+    print(f"  Total changes:    {total_changes}")
+    if status.get("skipped_ineligible", 0) > 0:
+        print(f"  Skipped (too large): {status['skipped_ineligible']}")
+    print()
+    print_info("Run 'Sync project' to apply these changes.")
+
+
+async def watch_project():
+    """Start a background watcher for a project."""
+    from cli.watcher import list_active_watchers, start_watcher_daemon
+    from code_context.db.pool import DatabasePool
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+        active_watchers = list_active_watchers()
+        watching_paths = {w["project_path"] for w in active_watchers}
+
+        if projects:
+            # Mark projects that are already being watched
+            options = ["[Enter new path]"]
+            for p in projects:
+                if p["project_root"] in watching_paths:
+                    options.append(f"{p['project_root']} [WATCHING]")
+                else:
+                    options.append(p["project_root"])
+
+            selected = gum_choose(options, header="Select project to watch:")
+
+            if not selected:
+                print_info("Cancelled.")
+                return
+
+            if selected == "[Enter new path]":
+                path_input = gum_input(placeholder="/path/to/project", header="Enter project path:")
+                if not path_input:
+                    print_info("Cancelled.")
+                    return
+                project_path = Path(path_input).expanduser().resolve()
+            elif "[WATCHING]" in selected:
+                print_warning("This project is already being watched.")
+                return
+            else:
+                project_path = Path(selected)
+        else:
+            path_input = gum_input(placeholder="/path/to/project", header="Enter project path to watch:")
+            if not path_input:
+                print_info("Cancelled.")
+                return
+            project_path = Path(path_input).expanduser().resolve()
+
+        if not project_path.is_dir():
+            print_error(f"Not a directory: {project_path}")
+            return
+
+        await db.close()
+
+        print()
+        print_info(f"Starting background watcher for: {project_path}")
+
+        success, message = start_watcher_daemon(str(project_path))
+
+        if success:
+            print_success(message)
+            print_info("Watcher is running in background. Use 'Manage watchers' to stop it.")
+        else:
+            print_error(message)
+
+    except Exception as e:
+        print_error(f"Error: {e}")
+        await db.close()
+
+
+async def manage_watchers():
+    """List and manage active watchers."""
+    from cli.watcher import get_watcher_log, list_active_watchers, stop_watcher_by_pid
+
+    while True:
+        watchers = list_active_watchers()
+
+        if not watchers:
+            print_warning("No active watchers.")
+            return
+
+        print()
+        print(gum_style("Active Watchers", bold=True, foreground="212"))
+        print()
+
+        options = []
+        for w in watchers:
+            started = w.get("started_at", "unknown")
+            if isinstance(started, str) and "T" in started:
+                started = started.split("T")[1].split(".")[0]
+            options.append(f"PID {w['pid']} | {Path(w['project_path']).name} | Started: {started}")
+
+        options.append("─" * 40)
+        options.append("🛑 Stop all watchers")
+        options.append("📜 View watcher logs")
+        options.append("🔙 Back to main menu")
+
+        selected = gum_choose(options, header="Select watcher to manage:")
+
+        if not selected or "Back to main menu" in selected:
+            return
+
+        if "Stop all watchers" in selected:
+            if gum_confirm("Stop all active watchers?"):
+                for w in watchers:
+                    stop_watcher_by_pid(w["pid"])
+                print_success("All watchers stopped.")
+            return
+
+        if "View watcher logs" in selected:
+            # Show log selection
+            log_options = []
+            for w in watchers:
+                log_file = get_watcher_log(w["project_path"])
+                if log_file:
+                    log_options.append(f"{Path(w['project_path']).name} → {log_file}")
+
+            if not log_options:
+                print_warning("No log files found.")
+                continue
+
+            log_selected = gum_choose(log_options, header="Select log to view:")
+            if log_selected:
+                log_path = log_selected.split(" → ")[1]
+                print()
+                print(gum_style(f"Log: {log_path}", bold=True))
+                print()
+                # Show last 30 lines
+                subprocess.run(["tail", "-30", log_path])
+                input("\nPress Enter to continue...")
+            continue
+
+        if selected.startswith("─"):
+            continue
+
+        # Stop specific watcher
+        pid = int(selected.split()[1])
+        watcher = next((w for w in watchers if w["pid"] == pid), None)
+
+        if watcher:
+            print()
+            print_info(f"Project: {watcher['project_path']}")
+            print_info(f"PID: {pid}")
+            print_info(f"Started: {watcher.get('started_at', 'unknown')}")
+
+            if gum_confirm(f"Stop this watcher?"):
+                if stop_watcher_by_pid(pid):
+                    print_success("Watcher stopped.")
+                else:
+                    print_error("Failed to stop watcher.")
+
+
+async def prune_orphans():
+    """Remove orphaned chunks from the database."""
+    from code_context.db.pool import DatabasePool
+
+    if not gum_confirm("Remove all orphaned chunks from the database?"):
+        print_info("Cancelled.")
+        return
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        async with db.acquire() as conn:
+            result = await conn.fetchval("SELECT cleanup_orphaned_chunks()")
+            print_success(f"Removed {result} orphaned chunks")
+    finally:
+        await db.close()
+
+
+async def reset_database():
+    """Reset entire database (delete all data)."""
+    from code_context.db.pool import DatabasePool
+
+    print()
+    print_warning("This will DELETE ALL indexed data!")
+    print()
+
+    if not gum_confirm("Are you sure you want to reset the database?"):
+        print_info("Cancelled.")
+        return
+
+    # Double confirm for destructive action
+    if not gum_confirm("This action cannot be undone. Continue?"):
+        print_info("Cancelled.")
+        return
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        async with db.acquire() as conn:
+            files_before = await conn.fetchval("SELECT COUNT(*) FROM code_files")
+            chunks_before = await conn.fetchval("SELECT COUNT(*) FROM code_chunks")
+
+            await conn.execute("DELETE FROM code_files")
+
+            print()
+            print_success(f"Deleted {files_before} files and {chunks_before} chunks")
+            print_info("Database is now empty.")
+    finally:
+        await db.close()
+
+
+async def global_stats():
+    """Show global statistics across all projects."""
+    from code_context.db.pool import DatabasePool
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        stats = await db.get_index_stats()
+
+        print()
+        print(gum_style("Global Statistics", bold=True, foreground="212"))
+        print()
+        print(f"  Total files:    {stats['total_files']}")
+        print(f"  Total chunks:   {stats['total_chunks']}")
+        print(f"  Total projects: {stats['total_projects']}")
+        print()
+
+        if stats["by_language"]:
+            print(gum_style("By Language:", bold=True))
+            for lang, data in stats["by_language"].items():
+                if data["files"]:
+                    avg_tokens = f"{data['avg_tokens']:.0f}" if data["avg_tokens"] else "N/A"
+                    print(f"\n  {gum_style(lang, foreground='14')}:")
+                    print(f"    Files:        {data['files']}")
+                    print(f"    Chunks:       {data['chunks']}")
+                    print(f"    ├─ file:        {data.get('files_chunks', 0)}")
+                    print(f"    ├─ declaration: {data.get('declarations', 0)}")
+                    print(f"    ├─ function:    {data['functions']}")
+                    print(f"    ├─ class:       {data['classes']}")
+                    print(f"    └─ method:      {data['methods']}")
+                    print(f"    Avg tokens/chunk: {avg_tokens}")
+
+    finally:
+        await db.close()
+
+
+async def main_menu():
+    """Main interactive menu."""
+    while True:
+        print()
+
+        # Check for active watchers to show count
+        from cli.watcher import list_active_watchers
+        active_watchers = list_active_watchers()
+        watcher_label = f"⚙️  Manage watchers ({len(active_watchers)} active)" if active_watchers else "⚙️  Manage watchers"
+
+        menu_options = [
+            "📋 List projects",
+            "📊 View project stats",
+            "➕ Index new project",
+            "🔄 Sync project (reindex changes)",
+            "🔄 Sync all projects",
+            "🔍 Check sync status (dry-run)",
+            "👁️  Start watcher (background)",
+            watcher_label,
+            "🗑️  Delete project",
+            "📈 Global statistics",
+            "🧹 Prune orphaned chunks",
+            "💣 Reset database",
+            "❌ Exit",
+        ]
+
+        choice = gum_choose(menu_options, header="What would you like to do?")
+
+        if not choice or "Exit" in choice:
+            print_info("Goodbye!")
+            break
+
+        print()
+
+        try:
+            if "List projects" in choice:
+                await list_projects()
+            elif "View project stats" in choice:
+                await view_project_stats()
+            elif "Index new project" in choice:
+                await index_project()
+            elif "Check sync status" in choice:
+                await check_sync_status()
+            elif "Sync all projects" in choice:
+                await quick_sync_all()
+            elif "Sync project" in choice:
+                await sync_project()
+            elif "Start watcher" in choice:
+                await watch_project()
+            elif "Manage watchers" in choice:
+                await manage_watchers()
+            elif "Delete project" in choice:
+                await delete_project()
+            elif "Global statistics" in choice:
+                await global_stats()
+            elif "Prune orphaned" in choice:
+                await prune_orphans()
+            elif "Reset database" in choice:
+                await reset_database()
+        except KeyboardInterrupt:
+            print()
+            print_info("Interrupted.")
+        except Exception as e:
+            print_error(f"Error: {e}")
+
+        # Pause before showing menu again
+        input("\nPress Enter to continue...")
+
+
+def main():
+    """Main entry point."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Interactive Code Context manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Quick commands (non-interactive):
+  --list                List all indexed projects
+  --stats               Show global statistics
+  --index PATH          Index a project (use --id to set custom ID)
+  --id ID               Project ID for indexing (default: folder name)
+  --delete ID           Delete a project by ID
+  --check ID            Check if project is up to date (dry-run)
+  --sync-all            Sync all indexed projects sequentially
+
+Interactive mode (default):
+  Run without arguments for interactive menu
+        """,
+    )
+    parser.add_argument("--list", "-l", action="store_true", help="List all projects")
+    parser.add_argument("--stats", "-s", action="store_true", help="Show global stats")
+    parser.add_argument("--index", "-i", metavar="PATH", help="Index a project")
+    parser.add_argument("--id", metavar="ID", help="Project ID (default: folder name)")
+    parser.add_argument("--sync", metavar="ID", help="Sync project (reindex only changed files)")
+    parser.add_argument("--check", metavar="ID", help="Check sync status (dry-run, no changes)")
+    parser.add_argument("--delete", "-d", metavar="ID", help="Delete a project by ID")
+    parser.add_argument("--force", "-f", action="store_true", help="Force reindex (with --index)")
+    parser.add_argument("--watch", "-w", metavar="PATH", help="Start background watcher for project")
+    parser.add_argument("--watchers", action="store_true", help="List active watchers")
+    parser.add_argument("--stop-watcher", metavar="PATH", help="Stop watcher for project")
+    parser.add_argument("--sync-all", action="store_true", help="Sync all projects sequentially")
+    parser.add_argument("--stop-all-watchers", action="store_true", help="Stop all active watchers")
+
+    args = parser.parse_args()
+
+    # Non-interactive quick commands
+    if args.list:
+        asyncio.run(list_projects())
+        return
+    if args.stats:
+        asyncio.run(global_stats())
+        return
+    if args.index:
+        asyncio.run(quick_index(args.index, project_id=args.id, force=args.force))
+        return
+    if args.sync_all:
+        asyncio.run(quick_sync_all())
+        return
+    if args.sync:
+        asyncio.run(quick_sync(args.sync))
+        return
+    if args.check:
+        asyncio.run(quick_check(args.check))
+        return
+    if args.delete:
+        asyncio.run(quick_delete(args.delete))
+        return
+    if args.watch:
+        quick_start_watcher(args.watch)
+        return
+    if args.watchers:
+        quick_list_watchers()
+        return
+    if args.stop_watcher:
+        quick_stop_watcher(args.stop_watcher)
+        return
+    if args.stop_all_watchers:
+        quick_stop_all_watchers()
+        return
+
+    # Interactive mode requires gum
+    if not gum_available():
+        print("Error: gum is not installed (required for interactive mode).")
+        print("Install it with: brew install gum")
+        print("Or use quick commands: --list, --stats, --index, --delete")
+        print("Run with --help for more info.")
+        sys.exit(1)
+
+    print_header()
+
+    try:
+        asyncio.run(main_menu())
+    except KeyboardInterrupt:
+        print()
+        print_info("Goodbye!")
+
+
+async def quick_index(path: str, project_id: str | None = None, force: bool = False):
+    """Quick non-interactive index command."""
+    from code_context.db.pool import DatabasePool
+    from code_context.embedding.voyage import VoyageClient
+    from code_context.indexer import Indexer
+
+    project_path = Path(path).expanduser().resolve()
+
+    if not project_path.is_dir():
+        print(f"Error: Not a directory: {project_path}")
+        return
+
+    # Default project_id to folder name if not specified
+    if not project_id:
+        project_id = project_path.name
+
+    print(f"Indexing: {project_path}")
+    print(f"Project ID: {project_id}")
+    print("This may take a while for large projects...")
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        voyage = VoyageClient()
+        indexer = Indexer(db, voyage)
+
+        stats = await indexer.index_project(
+            project_root=str(project_path),
+            project_id=project_id,
+            force=force,
+        )
+
+        print(f"✓ Indexed {stats['indexed_files']} files as '{project_id}'")
+        print(f"  Total files scanned: {stats['total_files']}")
+        print(f"  Files skipped: {stats['skipped_files']}")
+        print(f"  Total chunks: {stats['total_chunks']}")
+
+        if stats["errors"]:
+            print(f"  Errors: {len(stats['errors'])}")
+    finally:
+        await db.close()
+
+
+async def quick_sync(project_id: str):
+    """Quick non-interactive sync command."""
+    from code_context.db.pool import DatabasePool
+    from code_context.embedding.voyage import VoyageClient
+    from code_context.indexer import Indexer
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        # Find the project
+        projects = await db.list_projects()
+        project = next((p for p in projects if p["project_id"] == project_id), None)
+
+        if not project:
+            print(f"Project not found: {project_id}")
+            print("Available projects:")
+            for p in projects:
+                print(f"  - {p['project_id']}")
+            return
+
+        project_path = project["project_root"]
+        print(f"Syncing: {project_path}")
+        print("Checking for modified files...")
+
+        voyage = VoyageClient()
+        indexer = Indexer(db, voyage)
+
+        stats = await indexer.index_project(
+            project_root=project_path,
+            project_id=project_id,
+            force=False,  # Only changed files
+        )
+
+        deleted = stats.get("deleted_files", 0)
+        if stats["indexed_files"] == 0 and deleted == 0:
+            print("✓ Already up to date! No changes detected.")
+        else:
+            parts = []
+            if stats["indexed_files"] > 0:
+                parts.append(f"{stats['indexed_files']} reindexed")
+            if deleted > 0:
+                parts.append(f"{deleted} removed")
+            print(f"✓ Synced: {', '.join(parts)}")
+
+        print(f"  Files scanned:   {stats['total_files']}")
+        print(f"  Files reindexed: {stats['indexed_files']}")
+        print(f"  Files unchanged: {stats['skipped_files']}")
+        if deleted > 0:
+            print(f"  Files removed:   {deleted}")
+        print(f"  Chunks created:  {stats['total_chunks']}")
+
+        if stats["errors"]:
+            print(f"  Errors: {len(stats['errors'])}")
+
+    finally:
+        await db.close()
+
+
+async def quick_sync_all():
+    """Sync all indexed projects sequentially."""
+    from code_context.db.pool import DatabasePool
+    from code_context.embedding.voyage import VoyageClient
+    from code_context.indexer import Indexer
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+
+        if not projects:
+            print("No projects indexed.")
+            return
+
+        print(f"Syncing {len(projects)} project(s)...\n")
+
+        total_indexed = 0
+        total_removed = 0
+        total_errors = 0
+
+        voyage = VoyageClient()
+        indexer = Indexer(db, voyage)
+
+        for i, project in enumerate(projects, 1):
+            project_id = project["project_id"]
+            project_path = project["project_root"]
+            print(f"[{i}/{len(projects)}] {project_id} ({project_path})")
+
+            if not Path(project_path).is_dir():
+                print(f"  ⚠ Path not found, skipping")
+                continue
+
+            try:
+                stats = await indexer.index_project(
+                    project_root=project_path,
+                    project_id=project_id,
+                    force=False,
+                )
+
+                indexed = stats["indexed_files"]
+                deleted = stats.get("deleted_files", 0)
+                errors = len(stats.get("errors", []))
+
+                total_indexed += indexed
+                total_removed += deleted
+                total_errors += errors
+
+                if indexed == 0 and deleted == 0:
+                    print(f"  ✓ Up to date")
+                else:
+                    parts = []
+                    if indexed > 0:
+                        parts.append(f"{indexed} indexed")
+                    if deleted > 0:
+                        parts.append(f"{deleted} removed")
+                    print(f"  ✓ {', '.join(parts)}")
+                if errors > 0:
+                    print(f"  ⚠ {errors} error(s)")
+
+            except Exception as e:
+                print(f"  ✗ Error: {e}")
+                total_errors += 1
+
+        print(f"\nDone: {total_indexed} indexed, {total_removed} removed, {total_errors} error(s)")
+
+    finally:
+        await db.close()
+
+
+async def quick_check(project_id: str):
+    """Quick non-interactive check sync status command."""
+    from code_context.db.pool import DatabasePool
+    from code_context.indexer import Indexer
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        projects = await db.list_projects()
+        project = next((p for p in projects if p["project_id"] == project_id), None)
+
+        if not project:
+            print(f"Project not found: {project_id}")
+            print("Available projects:")
+            for p in projects:
+                print(f"  - {p['project_id']}")
+            return
+
+        project_path = project["project_root"]
+        print(f"Checking: {project_path}")
+
+        indexer = Indexer(db, None)
+        status = await indexer.check_status(
+            project_root=project_path,
+            project_id=project_id,
+        )
+
+        print()
+        if status["up_to_date"]:
+            print(f"✓ Up to date ({status['total_indexed']} files)")
+        else:
+            new_count = len(status["new"])
+            mod_count = len(status["modified"])
+            del_count = len(status["deleted"])
+            print(f"⚠ Out of sync: +{new_count} new, ~{mod_count} modified, -{del_count} deleted")
+            if status["new"]:
+                for f in status["new"][:5]:
+                    print(f"  + {f}")
+                if len(status["new"]) > 5:
+                    print(f"  ... +{len(status['new']) - 5} more")
+            if status["modified"]:
+                for f in status["modified"][:5]:
+                    print(f"  ~ {f}")
+                if len(status["modified"]) > 5:
+                    print(f"  ... +{len(status['modified']) - 5} more")
+            if status["deleted"]:
+                for f in status["deleted"][:5]:
+                    print(f"  - {f}")
+                if len(status["deleted"]) > 5:
+                    print(f"  ... +{len(status['deleted']) - 5} more")
+            if status.get("skipped_ineligible", 0) > 0:
+                print(f"  ({status['skipped_ineligible']} files skipped - too large)")
+            print(f"\nRun 'cc2 --sync {project_id}' to apply changes.")
+
+    finally:
+        await db.close()
+
+
+async def quick_delete(project_id: str):
+    """Quick non-interactive delete command."""
+    from code_context.db.pool import DatabasePool
+
+    db = DatabasePool()
+    await db.initialize()
+
+    try:
+        result = await db.delete_project(project_id)
+        if result["deleted_files"] > 0:
+            print(f"✓ Deleted {result['deleted_files']} files and {result['deleted_chunks']} chunks")
+        else:
+            print(f"Project not found: {project_id}")
+    finally:
+        await db.close()
+
+
+def quick_start_watcher(path: str):
+    """Quick non-interactive start watcher command."""
+    from cli.watcher import start_watcher_daemon
+
+    project_path = Path(path).expanduser().resolve()
+
+    if not project_path.is_dir():
+        print(f"Error: Not a directory: {project_path}")
+        return
+
+    success, message = start_watcher_daemon(str(project_path))
+    print(message)
+
+
+def quick_list_watchers():
+    """Quick non-interactive list watchers command."""
+    from cli.watcher import list_active_watchers
+
+    watchers = list_active_watchers()
+
+    if not watchers:
+        print("No active watchers")
+        return
+
+    print("Active watchers:")
+    for w in watchers:
+        started = w.get("started_at", "unknown")
+        if isinstance(started, str) and "T" in started:
+            started = started.split("T")[1].split(".")[0]
+        print(f"  PID {w['pid']}: {w['project_path']}")
+        print(f"    Started: {started}")
+
+
+def quick_stop_watcher(path: str):
+    """Quick non-interactive stop watcher command."""
+    from cli.watcher import stop_watcher
+
+    project_path = str(Path(path).expanduser().resolve())
+
+    if stop_watcher(project_path):
+        print(f"✓ Stopped watcher for: {project_path}")
+    else:
+        print(f"No active watcher for: {project_path}")
+
+
+def quick_stop_all_watchers():
+    """Quick non-interactive stop all watchers command."""
+    from cli.watcher import list_active_watchers, stop_watcher_by_pid
+
+    watchers = list_active_watchers()
+
+    if not watchers:
+        print("No active watchers")
+        return
+
+    for w in watchers:
+        stop_watcher_by_pid(w["pid"])
+        print(f"✓ Stopped watcher PID {w['pid']}: {w['project_path']}")
+
+    print(f"\n✓ Stopped {len(watchers)} watcher(s)")
+
+
+if __name__ == "__main__":
+    main()

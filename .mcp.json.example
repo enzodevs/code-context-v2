@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "code-context": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/code-context-v2",
+        "run",
+        "code-context"
+      ],
+      "env": {
+        "VOYAGE_API_KEY": "${VOYAGE_API_KEY}",
+        "DATABASE_URL": "postgresql://coderag:your_password@localhost:54329/coderag"
+      }
+    }
+  }
+}
