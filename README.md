@@ -1,6 +1,10 @@
-# Code Context v2
+<p align="center">
+  <img src="assets/logo.png" alt="Code Context v2" width="600">
+</p>
 
-Semantic code search as an MCP server. Index your codebases, search with natural language, get precise results.
+<p align="center">
+  Semantic code search as an MCP server. Index your codebases, search with natural language, get precise results.
+</p>
 
 Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) but works with any MCP-compatible client.
 
