@@ -11,10 +11,12 @@
 #   check           Check if project needs syncing (dry-run)
 #   delete, -d      Delete a project (requires id)
 #   watch, -w       Start watcher for a project
+#   watch-all       Start global watcher (all projects, single process)
 #   watchers        List active watchers
 #   sync-all        Sync all indexed projects
 #   stop            Stop watcher for a project
 #   stop-all        Stop all watchers
+#   stop-global     Stop the global watcher
 #
 # Examples:
 #   cc2                                    # Interactive menu
@@ -71,10 +73,12 @@ show_help() {
     echo "  sync-all            Sync all indexed projects"
     echo "  check ID            Check sync status (dry-run, no changes)"
     echo "  delete ID           Delete a project by ID"
-    echo "  watch PATH          Start background watcher"
+    echo "  watch PATH          Start background watcher (single project)"
+    echo "  watch-all           Start global watcher (all projects)"
     echo "  watchers            List active watchers"
     echo "  stop PATH           Stop watcher for project"
     echo "  stop-all            Stop all watchers"
+    echo "  stop-global         Stop the global watcher"
     echo ""
     echo "Examples:"
     echo "  cc2                                  # Interactive menu"
@@ -85,7 +89,8 @@ show_help() {
     echo "  cc2 sync my-proj                     # Sync (only changed files)"
     echo "  cc2 sync-all                         # Sync all projects"
     echo "  cc2 delete my-proj                   # Delete project"
-    echo "  cc2 watch ~/myproject                # Start watcher"
+    echo "  cc2 watch ~/myproject                # Start watcher (single project)"
+    echo "  cc2 watch-all                        # Start global watcher"
     echo ""
     echo "Pipeline: voyage-4-large (index) → voyage-4-lite (query) → rerank-2.5"
 }
@@ -213,6 +218,14 @@ cmd_stop_all() {
     run_cli --stop-all-watchers
 }
 
+cmd_watch_all() {
+    run_cli --watch-all
+}
+
+cmd_stop_global() {
+    run_cli --stop-global
+}
+
 cmd_interactive() {
     if ! command -v gum >/dev/null 2>&1; then
         print_warn "gum not installed. Using text mode."
@@ -257,6 +270,9 @@ main() {
         delete|--delete|-d)
             cmd_delete "${1:-}"
             ;;
+        watch-all|--watch-all)
+            cmd_watch_all
+            ;;
         watch|--watch|-w)
             cmd_watch "${1:-}"
             ;;
@@ -268,6 +284,9 @@ main() {
             ;;
         stop-all|--stop-all)
             cmd_stop_all
+            ;;
+        stop-global|--stop-global)
+            cmd_stop_global
             ;;
         *)
             print_error "Unknown command: ${cmd}"

@@ -644,9 +644,26 @@ async def watch_project():
         await db.close()
 
 
+async def watch_all_projects():
+    """Start the global watcher daemon (interactive)."""
+    from cli.watcher import is_global_watcher_running, start_global_watcher_daemon
+
+    if is_global_watcher_running():
+        print_warning("Global watcher is already running.")
+        return
+
+    print_info("Starting global watcher (all indexed projects)...")
+    success, message = start_global_watcher_daemon()
+    if success:
+        print_success(message)
+        print_info("Use 'Manage watchers' to stop it.")
+    else:
+        print_error(message)
+
+
 async def manage_watchers():
     """List and manage active watchers."""
-    from cli.watcher import get_watcher_log, list_active_watchers, stop_watcher_by_pid
+    from cli.watcher import get_global_watcher_log, get_watcher_log, list_active_watchers, stop_watcher_by_pid
 
     while True:
         watchers = list_active_watchers()
@@ -664,7 +681,10 @@ async def manage_watchers():
             started = w.get("started_at", "unknown")
             if isinstance(started, str) and "T" in started:
                 started = started.split("T")[1].split(".")[0]
-            options.append(f"PID {w['pid']} | {Path(w['project_path']).name} | Started: {started}")
+            if w.get("is_global"):
+                options.append(f"PID {w['pid']} | [GLOBAL WATCHER] | Started: {started}")
+            else:
+                options.append(f"PID {w['pid']} | {Path(w['project_path']).name} | Started: {started}")
 
         options.append("─" * 40)
         options.append("🛑 Stop all watchers")
@@ -687,9 +707,14 @@ async def manage_watchers():
             # Show log selection
             log_options = []
             for w in watchers:
-                log_file = get_watcher_log(w["project_path"])
-                if log_file:
-                    log_options.append(f"{Path(w['project_path']).name} → {log_file}")
+                if w.get("is_global"):
+                    log_file = get_global_watcher_log()
+                    if log_file:
+                        log_options.append(f"[GLOBAL] → {log_file}")
+                else:
+                    log_file = get_watcher_log(w["project_path"])
+                    if log_file:
+                        log_options.append(f"{Path(w['project_path']).name} → {log_file}")
 
             if not log_options:
                 print_warning("No log files found.")
@@ -822,9 +847,19 @@ async def main_menu():
         print()
 
         # Check for active watchers to show count
-        from cli.watcher import list_active_watchers
+        from cli.watcher import is_global_watcher_running, list_active_watchers
         active_watchers = list_active_watchers()
-        watcher_label = f"⚙️  Manage watchers ({len(active_watchers)} active)" if active_watchers else "⚙️  Manage watchers"
+        global_running = is_global_watcher_running()
+        n_individual = sum(1 for w in active_watchers if not w.get("is_global"))
+
+        if global_running:
+            watcher_label = f"⚙️  Manage watchers (global + {n_individual} individual)"
+        elif active_watchers:
+            watcher_label = f"⚙️  Manage watchers ({n_individual} active)"
+        else:
+            watcher_label = "⚙️  Manage watchers"
+
+        global_label = "🌐 Global watcher (running)" if global_running else "🌐 Start global watcher (all projects)"
 
         menu_options = [
             "📋 List projects",
@@ -833,7 +868,8 @@ async def main_menu():
             "🔄 Sync project (reindex changes)",
             "🔄 Sync all projects",
             "🔍 Check sync status (dry-run)",
-            "👁️  Start watcher (background)",
+            global_label,
+            "👁️  Start watcher (single project)",
             watcher_label,
             "🗑️  Delete project",
             "📈 Global statistics",
@@ -863,6 +899,8 @@ async def main_menu():
                 await quick_sync_all()
             elif "Sync project" in choice:
                 await sync_project()
+            elif "Global watcher" in choice:
+                await watch_all_projects()
             elif "Start watcher" in choice:
                 await watch_project()
             elif "Manage watchers" in choice:
@@ -901,6 +939,8 @@ Quick commands (non-interactive):
   --delete ID           Delete a project by ID
   --check ID            Check if project is up to date (dry-run)
   --sync-all            Sync all indexed projects sequentially
+  --watch-all           Start global watcher (all projects, single process)
+  --stop-global         Stop the global watcher
 
 Interactive mode (default):
   Run without arguments for interactive menu
@@ -919,6 +959,8 @@ Interactive mode (default):
     parser.add_argument("--stop-watcher", metavar="PATH", help="Stop watcher for project")
     parser.add_argument("--sync-all", action="store_true", help="Sync all projects sequentially")
     parser.add_argument("--stop-all-watchers", action="store_true", help="Stop all active watchers")
+    parser.add_argument("--watch-all", action="store_true", help="Start global watcher for all projects")
+    parser.add_argument("--stop-global", action="store_true", help="Stop the global watcher")
 
     args = parser.parse_args()
 
@@ -955,6 +997,12 @@ Interactive mode (default):
         return
     if args.stop_all_watchers:
         quick_stop_all_watchers()
+        return
+    if args.watch_all:
+        quick_start_global_watcher()
+        return
+    if args.stop_global:
+        quick_stop_global_watcher()
         return
 
     # Interactive mode requires gum
@@ -1253,7 +1301,10 @@ def quick_list_watchers():
         started = w.get("started_at", "unknown")
         if isinstance(started, str) and "T" in started:
             started = started.split("T")[1].split(".")[0]
-        print(f"  PID {w['pid']}: {w['project_path']}")
+        if w.get("is_global"):
+            print(f"  PID {w['pid']}: [GLOBAL] (all projects)")
+        else:
+            print(f"  PID {w['pid']}: {w['project_path']}")
         print(f"    Started: {started}")
 
 
@@ -1269,6 +1320,28 @@ def quick_stop_watcher(path: str):
         print(f"No active watcher for: {project_path}")
 
 
+def quick_start_global_watcher():
+    """Quick non-interactive start global watcher command."""
+    from cli.watcher import is_global_watcher_running, start_global_watcher_daemon
+
+    if is_global_watcher_running():
+        print("Global watcher is already running.")
+        return
+
+    success, message = start_global_watcher_daemon()
+    print(message)
+
+
+def quick_stop_global_watcher():
+    """Quick non-interactive stop global watcher command."""
+    from cli.watcher import stop_global_watcher
+
+    if stop_global_watcher():
+        print("✓ Global watcher stopped.")
+    else:
+        print("No global watcher running.")
+
+
 def quick_stop_all_watchers():
     """Quick non-interactive stop all watchers command."""
     from cli.watcher import list_active_watchers, stop_watcher_by_pid
@@ -1281,7 +1354,8 @@ def quick_stop_all_watchers():
 
     for w in watchers:
         stop_watcher_by_pid(w["pid"])
-        print(f"✓ Stopped watcher PID {w['pid']}: {w['project_path']}")
+        label = "[GLOBAL]" if w.get("is_global") else w["project_path"]
+        print(f"✓ Stopped watcher PID {w['pid']}: {label}")
 
     print(f"\n✓ Stopped {len(watchers)} watcher(s)")
 

@@ -13,6 +13,7 @@ import json
 import os
 import signal
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +22,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Directory for storing watcher state
 WATCHERS_DIR = Path.home() / ".code-context" / "watchers"
+
+# Global watcher constants
+GLOBAL_WATCHER_SENTINEL = "__global__"
+GLOBAL_WATCHER_PID_FILE = WATCHERS_DIR / "global.json"
+GLOBAL_WATCHER_LOG = WATCHERS_DIR / "logs" / "global.log"
 
 
 def get_watcher_id(project_path: str) -> str:
@@ -382,6 +388,376 @@ def get_watcher_log(project_path: str) -> str | None:
     watcher_id = get_watcher_id(project_path)
     log_file = WATCHERS_DIR / "logs" / f"{watcher_id}.log"
     return str(log_file) if log_file.exists() else None
+
+
+# ---------------------------------------------------------------------------
+# Global watcher — single daemon for all indexed projects
+# ---------------------------------------------------------------------------
+
+
+def _compute_pool_max_size(n_projects: int) -> int:
+    """Scale DB pool size based on project count."""
+    return min(50, max(20, n_projects * 2 + 5))
+
+
+def is_global_watcher_running() -> bool:
+    """Check if the global watcher daemon is running."""
+    if not GLOBAL_WATCHER_PID_FILE.exists():
+        return False
+    try:
+        info = json.loads(GLOBAL_WATCHER_PID_FILE.read_text())
+        pid = info.get("pid")
+        if pid and is_process_running(pid):
+            return True
+        # Stale PID file — clean up
+        GLOBAL_WATCHER_PID_FILE.unlink(missing_ok=True)
+        return False
+    except (json.JSONDecodeError, KeyError, OSError):
+        GLOBAL_WATCHER_PID_FILE.unlink(missing_ok=True)
+        return False
+
+
+def stop_global_watcher() -> bool:
+    """Stop the global watcher daemon."""
+    if not GLOBAL_WATCHER_PID_FILE.exists():
+        return False
+    try:
+        info = json.loads(GLOBAL_WATCHER_PID_FILE.read_text())
+        pid = info.get("pid")
+        if pid and is_process_running(pid):
+            os.kill(pid, signal.SIGTERM)
+            import time
+            for _ in range(20):  # up to 2s grace
+                if not is_process_running(pid):
+                    break
+                time.sleep(0.1)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        GLOBAL_WATCHER_PID_FILE.unlink(missing_ok=True)
+        return True
+    except (json.JSONDecodeError, OSError):
+        GLOBAL_WATCHER_PID_FILE.unlink(missing_ok=True)
+        return False
+
+
+def get_global_watcher_log() -> str | None:
+    """Get the global watcher log file path."""
+    return str(GLOBAL_WATCHER_LOG) if GLOBAL_WATCHER_LOG.exists() else None
+
+
+@dataclass
+class GlobalWatcherState:
+    """Shared state for the global watcher."""
+
+    db: object  # DatabasePool
+    indexer: object  # Indexer
+    index_sem: asyncio.Semaphore
+    known_files: dict[str, set[str]] = field(default_factory=dict)
+    tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    shutdown: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+def _ts() -> str:
+    """Short timestamp for log lines."""
+    return datetime.now().strftime("%H:%M:%S")
+
+
+async def _watch_single_project(
+    state: GlobalWatcherState,
+    project_id: str,
+    project_root: str,
+    poll_interval: int,
+) -> None:
+    """Poll loop for a single project inside the global watcher."""
+    path = Path(project_root)
+    tag = f"[{project_id}]"
+
+    if not path.is_dir():
+        print(f"[{_ts()}] {tag} Path not found: {path}", flush=True)
+        return
+
+    indexer = state.indexer
+
+    # Initial file collection
+    collected = indexer._collect_files(path)
+    state.known_files[project_id] = {str(p) for p, _ in collected}
+    print(f"[{_ts()}] {tag} Tracking {len(state.known_files[project_id])} files", flush=True)
+
+    # Initial sync
+    print(f"[{_ts()}] {tag} Initial sync...", flush=True)
+    try:
+        result = await indexer.index_project(str(path), project_id, force=False)
+        indexed = result["indexed_files"]
+        if indexed > 0:
+            print(f"[{_ts()}] {tag} Synced {indexed} files ({result['total_chunks']} chunks)", flush=True)
+        else:
+            print(f"[{_ts()}] {tag} Up to date", flush=True)
+    except Exception as e:
+        print(f"[{_ts()}] {tag} Sync error: {e}", flush=True)
+
+    last_poll_time = datetime.now().timestamp()
+
+    try:
+        while not state.shutdown.is_set():
+            await asyncio.sleep(poll_interval)
+            if state.shutdown.is_set():
+                break
+
+            poll_start = datetime.now().timestamp()
+            known = state.known_files.get(project_id, set())
+
+            # Scan for changes
+            collected = indexer._collect_files(path)
+            current_files: set[str] = set()
+            files_to_check: list[str] = []
+
+            for file_path, _lang in collected:
+                filepath_str = str(file_path)
+                current_files.add(filepath_str)
+                try:
+                    mtime = file_path.stat().st_mtime
+                    if mtime >= last_poll_time - 1:
+                        files_to_check.append(filepath_str)
+                except OSError:
+                    pass
+
+            # Detect deleted files
+            deleted_files = known - current_files
+            for filepath in deleted_files:
+                filename = Path(filepath).name
+                print(f"[{_ts()}] {tag} Deleted: {filename}")
+                await indexer.remove_file(filepath)
+
+            # Update known files
+            state.known_files[project_id] = current_files
+
+            # Index changed files with shared semaphore
+            indexed_count = 0
+            if files_to_check and not state.shutdown.is_set():
+                async def _index_one(fp: str):
+                    async with state.index_sem:
+                        return fp, await indexer.index_file(
+                            fp, str(path), project_id, force=False
+                        )
+
+                results = await asyncio.gather(
+                    *[_index_one(fp) for fp in files_to_check],
+                    return_exceptions=True,
+                )
+
+                for i, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        filename = Path(files_to_check[i]).name
+                        print(f"[{_ts()}] {tag} Error: {filename}: {res}")
+                    else:
+                        fp, index_result = res
+                        if index_result["indexed"]:
+                            indexed_count += 1
+                            filename = Path(fp).name
+                            print(f"[{_ts()}] {tag} Indexed: {filename} ({index_result['chunks']} chunks)")
+
+            last_poll_time = poll_start
+
+            if indexed_count > 0 or deleted_files:
+                print(f"[{_ts()}] {tag} Sync: {indexed_count} indexed, {len(deleted_files)} deleted", flush=True)
+
+    except asyncio.CancelledError:
+        print(f"[{_ts()}] {tag} Task cancelled", flush=True)
+
+
+async def _project_refresh_loop(
+    state: GlobalWatcherState,
+    poll_interval: int,
+    refresh_interval: int = 300,
+) -> None:
+    """Periodically refresh the project list to detect additions/removals."""
+    try:
+        while not state.shutdown.is_set():
+            await asyncio.sleep(refresh_interval)
+            if state.shutdown.is_set():
+                break
+
+            print(f"[{_ts()}] [global] Refreshing project list...", flush=True)
+
+            projects = await state.db.list_projects()
+            current_ids = {p["project_id"]: p["project_root"] for p in projects}
+            tracked_ids = set(state.tasks.keys())
+
+            # New projects
+            for pid, proot in current_ids.items():
+                if pid not in tracked_ids:
+                    if not Path(proot).is_dir():
+                        print(f"[{_ts()}] [global] Skipping {pid}: path not found", flush=True)
+                        continue
+                    print(f"[{_ts()}] [global] Adding project: {pid}", flush=True)
+                    state.known_files[pid] = set()
+                    task = asyncio.create_task(
+                        _watch_single_project(state, pid, proot, poll_interval),
+                        name=f"watch-{pid}",
+                    )
+                    state.tasks[pid] = task
+
+            # Removed projects
+            for pid in tracked_ids - set(current_ids.keys()):
+                print(f"[{_ts()}] [global] Removing project: {pid}", flush=True)
+                task = state.tasks.pop(pid, None)
+                if task:
+                    task.cancel()
+                state.known_files.pop(pid, None)
+
+            print(f"[{_ts()}] [global] Watching {len(state.tasks)} projects", flush=True)
+
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_global_watcher(poll_interval: int = 30, refresh_interval: int = 300):
+    """Run the global watcher — single process for all indexed projects."""
+    from code_context.db.pool import DatabasePool
+    from code_context.embedding.voyage import VoyageClient
+    from code_context.indexer import Indexer
+
+    # Load initial project list with a temporary pool
+    tmp_db = DatabasePool()
+    await tmp_db.initialize()
+    projects = await tmp_db.list_projects()
+    await tmp_db.close()
+
+    n = len(projects)
+    print(f"[{_ts()}] [global] Found {n} indexed project(s)", flush=True)
+
+    # Create shared resources with scaled pool
+    pool_max = _compute_pool_max_size(n)
+    print(f"[{_ts()}] [global] DB pool max_size={pool_max}", flush=True)
+
+    db = DatabasePool(max_size=pool_max)
+    await db.initialize()
+    voyage = VoyageClient()
+    indexer = Indexer(db, voyage)
+
+    from code_context.config import get_settings
+    settings = get_settings()
+
+    state = GlobalWatcherState(
+        db=db,
+        indexer=indexer,
+        index_sem=asyncio.Semaphore(settings.index_concurrency),
+    )
+
+    # Stagger startup: spread initial syncs across the poll interval
+    stagger_delay = poll_interval / max(n, 1) if n > 0 else 0
+    for i, p in enumerate(projects):
+        pid = p["project_id"]
+        proot = p["project_root"]
+        if not Path(proot).is_dir():
+            print(f"[{_ts()}] [global] Skipping {pid}: path not found", flush=True)
+            continue
+        state.known_files[pid] = set()
+        task = asyncio.create_task(
+            _watch_single_project(state, pid, proot, poll_interval),
+            name=f"watch-{pid}",
+        )
+        state.tasks[pid] = task
+        if stagger_delay > 0 and i < n - 1:
+            await asyncio.sleep(stagger_delay)
+
+    # Start refresh loop
+    refresh_task = asyncio.create_task(
+        _project_refresh_loop(state, poll_interval, refresh_interval),
+        name="project-refresh",
+    )
+
+    # Signal handling
+    def shutdown_handler(signum, frame):
+        print(f"\n[{_ts()}] [global] Shutdown requested...", flush=True)
+        state.shutdown.set()
+
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    # Wait for shutdown
+    await state.shutdown.wait()
+
+    # Cancel all tasks
+    print(f"[{_ts()}] [global] Cancelling {len(state.tasks)} project task(s)...", flush=True)
+    refresh_task.cancel()
+    for task in state.tasks.values():
+        task.cancel()
+    all_tasks = list(state.tasks.values()) + [refresh_task]
+    await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    await db.close()
+    GLOBAL_WATCHER_PID_FILE.unlink(missing_ok=True)
+    print(f"[{_ts()}] [global] Shutdown complete.", flush=True)
+
+
+def start_global_watcher_daemon(
+    poll_interval: int = 30,
+    refresh_interval: int = 300,
+) -> tuple[bool, str]:
+    """Start the global watcher daemon in the background.
+
+    Returns (success, message).
+    """
+    if is_global_watcher_running():
+        info = json.loads(GLOBAL_WATCHER_PID_FILE.read_text())
+        return False, f"Global watcher already running (PID: {info['pid']})"
+
+    pid = os.fork()
+
+    if pid > 0:
+        # Parent — wait up to 1.5s for daemon to write PID file
+        import time
+        for _ in range(15):
+            if GLOBAL_WATCHER_PID_FILE.exists():
+                info = json.loads(GLOBAL_WATCHER_PID_FILE.read_text())
+                return True, f"Global watcher started (PID: {info['pid']})"
+            time.sleep(0.1)
+        return False, "Failed to start global watcher"
+
+    else:
+        # Child — daemonize
+        os.setsid()
+        pid2 = os.fork()
+        if pid2 > 0:
+            os._exit(0)
+
+        # Redirect I/O to log
+        log_dir = WATCHERS_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        sys.stdin.close()
+        log_fd = open(GLOBAL_WATCHER_LOG, "a", buffering=1)
+        os.dup2(log_fd.fileno(), sys.stdout.fileno())
+        os.dup2(log_fd.fileno(), sys.stderr.fileno())
+        sys.stdout = log_fd
+        sys.stderr = log_fd
+
+        # Save PID file
+        ensure_watchers_dir()
+        info = {
+            "project_path": GLOBAL_WATCHER_SENTINEL,
+            "pid": os.getpid(),
+            "started_at": datetime.now().isoformat(),
+            "is_global": True,
+            "poll_interval": poll_interval,
+            "refresh_interval": refresh_interval,
+        }
+        GLOBAL_WATCHER_PID_FILE.write_text(json.dumps(info, indent=2))
+
+        print(f"\n{'='*60}")
+        print(f"Global watcher started at {datetime.now().isoformat()}")
+        print(f"PID: {os.getpid()}")
+        print(f"Poll: {poll_interval}s | Refresh: {refresh_interval}s")
+        print(f"{'='*60}\n")
+
+        try:
+            asyncio.run(run_global_watcher(poll_interval, refresh_interval))
+        except Exception as e:
+            print(f"Global watcher error: {e}")
+        finally:
+            GLOBAL_WATCHER_PID_FILE.unlink(missing_ok=True)
+
+        os._exit(0)
 
 
 if __name__ == "__main__":

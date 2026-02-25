@@ -18,8 +18,10 @@ logger = logging.getLogger(__name__)
 class DatabasePool:
     """Manages asyncpg connection pool with pgvector support."""
 
-    def __init__(self, dsn: str | None = None):
+    def __init__(self, dsn: str | None = None, min_size: int = 5, max_size: int = 20):
         self.dsn = dsn or get_settings().database_url
+        self._min_size = min_size
+        self._max_size = max_size
         self._pool: asyncpg.Pool | None = None
         self._lock = asyncio.Lock()
 
@@ -37,8 +39,8 @@ class DatabasePool:
 
             self._pool = await asyncpg.create_pool(
                 self.dsn,
-                min_size=5,
-                max_size=20,
+                min_size=self._min_size,
+                max_size=self._max_size,
                 max_inactive_connection_lifetime=300,
                 init=init_connection,
             )
