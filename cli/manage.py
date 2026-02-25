@@ -859,7 +859,7 @@ async def main_menu():
         else:
             watcher_label = "⚙️  Manage watchers"
 
-        global_label = "🌐 Global watcher (running)" if global_running else "🌐 Start global watcher (all projects)"
+        global_label = "🌐 Global watcher (running)" if global_running else "🌐 Global watcher (start all projects)"
 
         menu_options = [
             "📋 List projects",
