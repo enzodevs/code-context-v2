@@ -38,72 +38,75 @@ def gum_style(text: str, **kwargs) -> str:
     return result.stdout.strip() if result.returncode == 0 else text
 
 
-def gum_choose(options: list[str], header: str = "") -> str | None:
+def gum_choose(options: list[str], header: str = "", height: int = 0) -> str | None:
     """Show selection menu with gum."""
+    args = [
+        "gum", "choose",
+        "--cursor", "▸ ",
+        "--cursor.foreground", "212",
+        "--header.foreground", "99",
+    ]
     if header:
-        print(gum_style(header, bold=True, foreground="212"))
-
-    # Escape options for shell
-    escaped_options = " ".join(f'"{opt}"' for opt in options)
-
-    # Use shell to ensure proper TTY handling
-    result = subprocess.run(
-        f'gum choose --cursor.foreground=212 {escaped_options}',
-        shell=True,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
+        args.extend(["--header", header])
+    if height > 0:
+        args.extend(["--height", str(height)])
+    args.append("--")
+    args.extend(options)
+    result = subprocess.run(args, stdout=subprocess.PIPE, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
 def gum_filter(options: list[str], header: str = "", placeholder: str = "Type to filter...") -> str | None:
     """Show filterable list with gum.
 
-    For small lists (<15 items), falls back to gum choose for better TTY handling.
-    For larger lists, uses printf piping for safe handling.
+    For small lists (<=8 items), falls back to gum choose (arrow-key selection).
+    For larger lists, uses gum filter with fuzzy search.
     """
+    if len(options) <= 8:
+        return gum_choose(options, header=header)
+
+    args = [
+        "gum", "filter",
+        "--indicator.foreground", "212",
+        "--prompt.foreground", "99",
+        "--placeholder", placeholder,
+        "--header.foreground", "99",
+    ]
     if header:
-        print(gum_style(header, bold=True, foreground="212"))
-
-    # For small lists, use gum choose (more reliable TTY handling)
-    if len(options) <= 15:
-        return gum_choose(options)
-
-    # For larger lists, use printf with %s for safe handling of special chars
-    escaped_placeholder = placeholder.replace('"', '\\"')
-    # Use printf with explicit newlines for each option
-    printf_args = "\\n".join(opt.replace("\\", "\\\\").replace('"', '\\"') for opt in options)
-    result = subprocess.run(
-        f'printf "%s\\n" "{printf_args}" | gum filter --placeholder "{escaped_placeholder}" --indicator.foreground=212',
-        shell=True,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
+        args.extend(["--header", header])
+    input_text = "\n".join(options)
+    result = subprocess.run(args, input=input_text, stdout=subprocess.PIPE, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
 def gum_confirm(prompt: str) -> bool:
     """Show confirmation prompt with gum."""
-    # Escape prompt for shell
-    escaped_prompt = prompt.replace('"', '\\"')
-    result = subprocess.run(
-        f'gum confirm "{escaped_prompt}" --affirmative=Yes --negative=No',
-        shell=True,
-    )
+    result = subprocess.run([
+        "gum", "confirm", prompt,
+        "--affirmative", "Yes", "--negative", "No",
+        "--prompt.foreground", "212",
+        "--selected.background", "212",
+        "--selected.foreground", "230",
+    ])
     return result.returncode == 0
 
 
-def gum_input(placeholder: str = "", header: str = "") -> str | None:
+def gum_input(placeholder: str = "", header: str = "", value: str = "") -> str | None:
     """Get text input with gum."""
+    args = [
+        "gum", "input",
+        "--cursor.foreground", "212",
+        "--prompt.foreground", "99",
+        "--prompt", "› ",
+        "--header.foreground", "99",
+    ]
     if header:
-        print(gum_style(header, bold=True, foreground="212"))
-    escaped_placeholder = placeholder.replace('"', '\\"')
-    result = subprocess.run(
-        f'gum input --placeholder "{escaped_placeholder}" --cursor.foreground=212',
-        shell=True,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
+        args.extend(["--header", header])
+    if placeholder:
+        args.extend(["--placeholder", placeholder])
+    if value:
+        args.extend(["--value", value])
+    result = subprocess.run(args, stdout=subprocess.PIPE, text=True)
     return result.stdout.strip() if result.returncode == 0 else None
 
 
@@ -119,14 +122,14 @@ def gum_spin(title: str, command: list[str]) -> subprocess.CompletedProcess:
 def print_header():
     """Print CLI header."""
     header = gum_style(
-        "  Code Context Manager  ",
+        "  Code Context v2  ",
         bold=True,
         foreground="212",
         border="rounded",
-        padding="1 2",
+        border_foreground="99",
+        padding="0 2",
     )
     print(header)
-    print()
 
 
 def print_success(message: str):
@@ -149,6 +152,11 @@ def print_warning(message: str):
     print(gum_style(f"⚠ {message}", foreground="11"))
 
 
+def pause():
+    """Styled pause prompt."""
+    input("\033[90m  press enter to continue…\033[0m ")
+
+
 async def list_projects():
     """List all indexed projects."""
     from code_context.db.pool import DatabasePool
@@ -164,18 +172,30 @@ async def list_projects():
             print_info("Use 'Index new project' to add one.")
             return
 
-        print(gum_style("Indexed Projects", bold=True, foreground="212"))
-        print()
+        import csv
+        import io
 
+        home = str(Path.home())
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["ID", "Path", "Files", "Chunks", "LOC", "Languages", "Last Indexed"])
         for p in projects:
-            langs = ", ".join(p["languages"]) if p["languages"] else "unknown"
+            langs = ", ".join(p["languages"]) if p["languages"] else "—"
             last = p["last_indexed"].strftime("%Y-%m-%d %H:%M") if p["last_indexed"] else "never"
+            path = p["project_root"].replace(home, "~")
+            writer.writerow([
+                p["project_id"], path, p["file_count"],
+                p["chunk_count"], p["total_loc"], langs, last,
+            ])
 
-            print(f"  {gum_style(p['project_id'], bold=True, foreground='212')} → {p['project_root']}")
-            print(f"    Files: {p['file_count']} | Chunks: {p['chunk_count']} | LOC: {p['total_loc']}")
-            print(f"    Languages: {langs}")
-            print(f"    Last indexed: {last}")
-            print()
+        print()
+        subprocess.run(
+            ["gum", "table", "--print",
+             "--border", "rounded",
+             "--border.foreground", "240",
+             "--header.foreground", "212"],
+            input=buf.getvalue(), text=True,
+        )
 
     finally:
         await db.close()
@@ -304,12 +324,10 @@ async def index_project():
 
     # Step 2: Get project ID (suggest basename as default)
     default_id = project_path.name
-    print()
-    print(gum_style(f"Suggested ID: {default_id}", foreground="240"))
 
     project_id = gum_input(
-        placeholder=default_id,
-        header="🏷️  Project ID (short name for searches):"
+        header="🏷️  Project ID (short name for searches):",
+        value=default_id,
     )
 
     # Use default if empty
@@ -673,8 +691,6 @@ async def manage_watchers():
             return
 
         print()
-        print(gum_style("Active Watchers", bold=True, foreground="212"))
-        print()
 
         options = []
         for w in watchers:
@@ -686,12 +702,12 @@ async def manage_watchers():
             else:
                 options.append(f"PID {w['pid']} | {Path(w['project_path']).name} | Started: {started}")
 
-        options.append("─" * 40)
+        options.append("────────────────────────────────")
         options.append("🛑 Stop all watchers")
         options.append("📜 View watcher logs")
         options.append("🔙 Back to main menu")
 
-        selected = gum_choose(options, header="Select watcher to manage:")
+        selected = gum_choose(options, header=f"Active Watchers ({len(watchers)})")
 
         if not selected or "Back to main menu" in selected:
             return
@@ -728,7 +744,7 @@ async def manage_watchers():
                 print()
                 # Show last 30 lines
                 subprocess.run(["tail", "-30", log_path])
-                input("\nPress Enter to continue...")
+                pause()
             continue
 
         if selected.startswith("─"):
@@ -853,36 +869,45 @@ async def main_menu():
         n_individual = sum(1 for w in active_watchers if not w.get("is_global"))
 
         if global_running:
-            watcher_label = f"⚙️  Manage watchers (global + {n_individual} individual)"
+            watcher_label = "⚙️   Manage watchers (global + {n} individual)".format(n=n_individual)
         elif active_watchers:
-            watcher_label = f"⚙️  Manage watchers ({n_individual} active)"
+            watcher_label = "⚙️   Manage watchers ({n} active)".format(n=n_individual)
         else:
-            watcher_label = "⚙️  Manage watchers"
+            watcher_label = "⚙️   Manage watchers"
 
-        global_label = "🌐 Global watcher (running)" if global_running else "🌐 Global watcher (start all projects)"
+        global_label = "🌐  Global watcher (running)" if global_running else "🌐  Global watcher (start all projects)"
 
         menu_options = [
-            "📋 List projects",
-            "📊 View project stats",
-            "➕ Index new project",
-            "🔄 Sync project (reindex changes)",
-            "🔄 Sync all projects",
-            "🔍 Check sync status (dry-run)",
-            global_label,
-            "👁️  Start watcher (single project)",
-            watcher_label,
-            "🗑️  Delete project",
-            "📈 Global statistics",
-            "🧹 Prune orphaned chunks",
-            "💣 Reset database",
-            "❌ Exit",
+            "── Projects ──────────────────────",
+            "   📋  List projects",
+            "   📊  View project stats",
+            "   ➕  Index new project",
+            "── Sync ────────────────────────────",
+            "   🔄  Sync project (reindex changes)",
+            "   🔄  Sync all projects",
+            "   🔍  Check sync status (dry-run)",
+            "── Watchers ────────────────────────",
+            f"   {global_label}",
+            "   👁️   Start watcher (single project)",
+            f"   {watcher_label}",
+            "── Tools ───────────────────────────",
+            "   📈  Global statistics",
+            "   🧹  Prune orphaned chunks",
+            "── Danger Zone ─────────────────────",
+            "   🗑️   Delete project",
+            "   💣  Reset database",
+            "   ❌  Exit",
         ]
 
-        choice = gum_choose(menu_options, header="What would you like to do?")
+        choice = gum_choose(menu_options, header="What would you like to do?", height=20)
 
         if not choice or "Exit" in choice:
             print_info("Goodbye!")
             break
+
+        # Skip separator selections
+        if choice.startswith("──"):
+            continue
 
         print()
 
@@ -920,7 +945,7 @@ async def main_menu():
             print_error(f"Error: {e}")
 
         # Pause before showing menu again
-        input("\nPress Enter to continue...")
+        pause()
 
 
 def main():

@@ -57,6 +57,8 @@ books/
 
 # Claude Code user config
 .claude/
+.agents/
+skills-lock.json
 
 # UV lock (let users resolve their own deps)
 uv.lock
