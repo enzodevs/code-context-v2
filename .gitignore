@@ -50,7 +50,7 @@ htmlcov/
 *.log
 
 # Books (copyrighted content - not for distribution)
-books/
+/books/
 
 # User-specific MCP config (contains local paths)
 .mcp.json

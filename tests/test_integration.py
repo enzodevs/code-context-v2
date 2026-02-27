@@ -3,15 +3,12 @@
 Run with: uv run pytest tests/ -v
 """
 
-import asyncio
 import json
 import pytest
-from pathlib import Path
 
 from code_context.chunking.parser import CodeParser, compute_chunk_hash, compute_file_hash
 from code_context.db.pool import DatabasePool
 from code_context.db.schema import CodeChunk, CodeFile
-from code_context.config import get_settings
 
 
 # Sample code for testing
@@ -62,6 +59,14 @@ class UserRepository:
         self._users[user.id] = user
 '''
 
+LARGE_TYPESCRIPT_CODE = TYPESCRIPT_CODE + "\n" + "\n".join(
+    [f"const pad_{i} = {i};" for i in range(230)]
+)
+
+LARGE_PYTHON_CODE = PYTHON_CODE + "\n" + "\n".join(
+    [f"x_{i} = {i}" for i in range(230)]
+)
+
 
 class TestParser:
     """Test the code parser."""
@@ -70,49 +75,51 @@ class TestParser:
         self.parser = CodeParser()
 
     def test_parse_typescript_function(self):
-        """Test parsing TypeScript exported function."""
+        """Small TS files should stay as a single file-level chunk."""
         chunks = self.parser.parse_file("test.ts", TYPESCRIPT_CODE)
-
-        # Should find: validateEmail function, UserService class, getUser method, createUser method
-        assert len(chunks) >= 2, f"Expected at least 2 chunks, got {len(chunks)}"
-
-        # Find the validateEmail function
-        func_chunk = next((c for c in chunks if c.symbol_name == "validateEmail"), None)
-        assert func_chunk is not None, "Should find validateEmail function"
-        assert func_chunk.chunk_type == "function"
-        assert "export function validateEmail" in func_chunk.text
-
-        # Check context metadata
-        assert "filepath" in func_chunk.context
-        assert "imports" in func_chunk.context
+        assert len(chunks) == 1, f"Expected 1 chunk for small file, got {len(chunks)}"
+        file_chunk = chunks[0]
+        assert file_chunk.chunk_type == "file"
+        assert file_chunk.symbol_name == "test.ts"
+        assert "export function validateEmail" in file_chunk.text
+        assert "filepath" in file_chunk.context
+        assert "imports" in file_chunk.context
 
     def test_parse_typescript_class(self):
-        """Test parsing TypeScript exported class."""
-        chunks = self.parser.parse_file("test.ts", TYPESCRIPT_CODE)
+        """Large TS files should include extracted symbols."""
+        chunks = self.parser.parse_file("test.ts", LARGE_TYPESCRIPT_CODE)
 
-        # Find the UserService class
-        class_chunk = next((c for c in chunks if c.symbol_name == "UserService"), None)
-        assert class_chunk is not None, "Should find UserService class"
-        assert class_chunk.chunk_type == "class"
-        assert "export class UserService" in class_chunk.text
+        # validateEmail appears as function chunk in larger files
+        validate_chunks = [c for c in chunks if c.symbol_name == "validateEmail"]
+        assert validate_chunks, "Should find validateEmail symbol"
+        assert any(c.chunk_type == "function" for c in validate_chunks)
+
+        # UserService is extracted as declaration chunk
+        class_chunks = [c for c in chunks if c.symbol_name == "UserService"]
+        assert class_chunks, "Should find UserService symbol"
+        assert any(c.chunk_type == "declaration" for c in class_chunks)
+        assert any("export class UserService" in c.text for c in class_chunks)
 
     def test_parse_python_function(self):
-        """Test parsing Python function."""
+        """Small Python files should stay as a single file-level chunk."""
         chunks = self.parser.parse_file("test.py", PYTHON_CODE)
-
-        # Find the validate_email function
-        func_chunk = next((c for c in chunks if c.symbol_name == "validate_email"), None)
-        assert func_chunk is not None, "Should find validate_email function"
-        assert func_chunk.chunk_type == "function"
+        assert len(chunks) == 1, f"Expected 1 chunk for small file, got {len(chunks)}"
+        file_chunk = chunks[0]
+        assert file_chunk.chunk_type == "file"
+        assert file_chunk.symbol_name == "test.py"
+        assert "class UserRepository" in file_chunk.text
 
     def test_parse_python_class(self):
-        """Test parsing Python class."""
-        chunks = self.parser.parse_file("test.py", PYTHON_CODE)
+        """Large Python files should expose declarations with symbol names."""
+        chunks = self.parser.parse_file("test.py", LARGE_PYTHON_CODE)
 
-        # Find the UserRepository class
+        # Small Python function is filtered out by chunk_min_tokens
+        func_chunk = next((c for c in chunks if c.symbol_name == "validate_email"), None)
+        assert func_chunk is None, "validate_email should be filtered as too small"
+
         class_chunk = next((c for c in chunks if c.symbol_name == "UserRepository"), None)
-        assert class_chunk is not None, "Should find UserRepository class"
-        assert class_chunk.chunk_type == "class"
+        assert class_chunk is not None, "Should find UserRepository declaration"
+        assert class_chunk.chunk_type == "declaration"
 
     def test_context_metadata_is_dict(self):
         """Test that context metadata is a dict (critical for JSONB)."""

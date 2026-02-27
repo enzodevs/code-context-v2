@@ -14,8 +14,8 @@ from fastmcp.dependencies import Depends
 from pydantic import BaseModel
 
 from code_context.config import get_settings
-from code_context.db.pool import DatabasePool
-from code_context.embedding.voyage import VoyageClient
+from code_context.db.pool import DatabasePool, get_db_pool
+from code_context.embedding.voyage import VoyageClient, get_voyage_client
 from code_context.retrieval.pipeline import RetrievalPipeline
 
 # Configure logging
@@ -43,36 +43,43 @@ class SearchResponse(BaseModel):
     results: list[CodeChunkResponse]
 
 
-# Dependency injection for database and voyage client
+# Shared app lifecycle
 @asynccontextmanager
-async def get_database():
-    """Database connection pool dependency."""
-    db = DatabasePool()
-    await db.initialize()
+async def app_lifespan(_server: FastMCP):
+    """Initialize shared resources once and cleanly close on shutdown."""
+    db = await get_db_pool()
+    get_voyage_client()
+    logger.info("Shared database pool and Voyage client initialized")
     try:
-        yield db
+        yield {}
     finally:
         await db.close()
+        logger.info("Shared database pool closed")
 
 
-@asynccontextmanager
-async def get_voyage():
-    """Voyage AI client dependency."""
-    yield VoyageClient()
+# Dependency injection for shared database and voyage clients
+async def get_database() -> DatabasePool:
+    """Shared database connection pool dependency."""
+    return await get_db_pool()
 
 
-@asynccontextmanager
-async def get_pipeline(
+def get_voyage() -> VoyageClient:
+    """Shared Voyage AI client dependency."""
+    return get_voyage_client()
+
+
+def get_pipeline(
     db: DatabasePool = Depends(get_database),
     voyage: VoyageClient = Depends(get_voyage),
-):
+) -> RetrievalPipeline:
     """Retrieval pipeline dependency."""
-    yield RetrievalPipeline(db, voyage)
+    return RetrievalPipeline(db, voyage)
 
 
 # Create FastMCP server
 mcp = FastMCP(
     name="code-context-v2",
+    lifespan=app_lifespan,
     instructions="""SOTA Context Engineering MCP Server for Codebases and Literature.
 
 CODE SEARCH:
