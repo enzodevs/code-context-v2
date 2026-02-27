@@ -101,6 +101,7 @@ async def search_codebase(
     chunk_type: Literal["function", "class", "method", "module"] | None = None,
     file_type: Literal["code", "docs", "all"] | None = None,
     directory: str | None = None,
+    search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
     pipeline: RetrievalPipeline = Depends(get_pipeline),
 ) -> SearchResponse:
     """Semantic search across the indexed codebase.
@@ -121,13 +122,18 @@ async def search_codebase(
                    "all" or None for all file types including docs and config
         directory: Scope search to a specific directory within the project.
                    Uses path prefix matching. Examples: "src/components", "apps/api/src", "lib/utils"
+        search_intent: Guides reranking toward a specific result type.
+                   "implementation" - concrete code that builds the feature
+                   "definition" - types, interfaces, schemas, data structures
+                   "usage" - call sites and integration examples
+                   "debug" - error handling, logging, edge cases
 
     Returns:
         SearchResponse with matching code chunks and pre-formatted context.
     """
     top_k = min(top_k, 20)  # Cap at 20
 
-    logger.info(f"search_codebase: query='{query[:50]}...', project={project}, top_k={top_k}, file_type={file_type}, directory={directory}")
+    logger.info(f"search_codebase: query='{query[:50]}...', project={project}, top_k={top_k}, file_type={file_type}, directory={directory}, intent={search_intent}")
 
     results = await pipeline.search(
         query=query,
@@ -137,6 +143,7 @@ async def search_codebase(
         project=project,
         file_type=file_type,
         directory=directory,
+        search_intent=search_intent,
     )
 
     chunks = [
@@ -165,6 +172,7 @@ async def search_by_file(
     query: str,
     project: str,
     top_k: int = 5,
+    search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
     pipeline: RetrievalPipeline = Depends(get_pipeline),
 ) -> SearchResponse:
     """Search within a specific file - useful for local refactoring.
@@ -179,19 +187,25 @@ async def search_by_file(
                Examples: "error handling", "validation logic", "main function"
         project: Project ID from list_projects (REQUIRED).
         top_k: Maximum number of results (default: 5, max: 10)
+        search_intent: Guides reranking toward a specific result type.
+                   "implementation" - concrete code that builds the feature
+                   "definition" - types, interfaces, schemas, data structures
+                   "usage" - call sites and integration examples
+                   "debug" - error handling, logging, edge cases
 
     Returns:
         SearchResponse with matching code chunks from the specified file.
     """
     top_k = min(top_k, 10)  # Cap at 10 for file-scoped search
 
-    logger.info(f"search_by_file: filepath='{filepath}', query='{query[:50]}...', project={project}")
+    logger.info(f"search_by_file: filepath='{filepath}', query='{query[:50]}...', project={project}, intent={search_intent}")
 
     results = await pipeline.search_file(
         filepath=filepath,
         query=query,
         top_k=top_k,
         project=project,
+        search_intent=search_intent,
     )
 
     chunks = [

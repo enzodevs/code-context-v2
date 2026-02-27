@@ -3,6 +3,7 @@
 import logging
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 import tiktoken
 
@@ -126,6 +127,7 @@ class RetrievalPipeline:
         project: str | None = None,
         file_type: str | None = None,
         directory: str | None = None,
+        search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
     ) -> list[SearchResult]:
         """Execute the full retrieval pipeline.
 
@@ -138,6 +140,11 @@ class RetrievalPipeline:
             project: Filter to specific project by its root path
             file_type: Filter by file type - "code" for code only, None/other for all
             directory: Filter to files within this directory path prefix
+            search_intent: Guides reranking toward a specific result type.
+                "implementation" - concrete code that builds the feature
+                "definition" - types, interfaces, schemas
+                "usage" - call sites and integration examples
+                "debug" - error handling, logging, edge cases
 
         Returns:
             List of SearchResult sorted by relevance (most relevant first)
@@ -186,9 +193,10 @@ class RetrievalPipeline:
 
         logger.debug(f"Phase 1: {len(candidates)} candidates above similarity {sim_threshold}")
 
-        # ===== PHASE 2: Rerank =====
+        # ===== PHASE 2: Rerank with instruction-following =====
         documents = [c.chunk_text for c in candidates]
-        rerank_results = await self.voyage.rerank(query, documents, top_k=len(candidates))
+        rerank_query = self._build_rerank_query(query, search_intent)
+        rerank_results = await self.voyage.rerank(rerank_query, documents, top_k=len(candidates))
 
         # Map rerank results back to candidates
         reranked: list[tuple[ChunkResult, float]] = [
@@ -248,6 +256,47 @@ class RetrievalPipeline:
 
         logger.debug(f"Returning {len(results)} results with ~{current_tokens} tokens")
         return results
+
+    # Mapping from search_intent to rerank instruction (Voyage rerank-2.5 instruction-following).
+    # Format follows Voyage/MongoDB recommendation: f"{instruction}\nQuery: {query}"
+    RERANK_INSTRUCTIONS: dict[str, str] = {
+        "implementation": (
+            "Prioritize code that directly implements or defines the described functionality. "
+            "Prefer concrete implementations (functions, classes, methods) over imports, "
+            "type definitions, or indirect references."
+        ),
+        "definition": (
+            "Prioritize type definitions, interfaces, schemas, data structures, and "
+            "configuration objects. Prefer declarations over usage examples."
+        ),
+        "usage": (
+            "Prioritize examples showing how this is called, imported, or integrated. "
+            "Prefer call sites and consumer code over the implementation itself."
+        ),
+        "debug": (
+            "Prioritize error handling, logging, edge cases, retry logic, and "
+            "defensive code. Prefer code that handles failure scenarios."
+        ),
+    }
+
+    # Default = implementation (wins 70% of queries in benchmarks)
+    DEFAULT_RERANK_INSTRUCTION = RERANK_INSTRUCTIONS["implementation"]
+
+    @staticmethod
+    def _build_rerank_query(
+        query: str,
+        search_intent: str | None = None,
+    ) -> str:
+        """Prepend a reranking instruction to the query.
+
+        rerank-2.5 supports instruction-following: natural language instructions
+        prepended to the query steer relevance scoring. Uses the Voyage-recommended
+        format: "{instruction}\\nQuery: {query}"
+        """
+        instruction = RetrievalPipeline.RERANK_INSTRUCTIONS.get(
+            search_intent or "", RetrievalPipeline.DEFAULT_RERANK_INSTRUCTION
+        )
+        return f"{instruction}\nQuery: {query}"
 
     def _deduplicate(
         self,
@@ -356,6 +405,7 @@ class RetrievalPipeline:
         query: str,
         top_k: int = 5,
         project: str | None = None,
+        search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
     ) -> list[SearchResult]:
         """Search within a specific file.
 
@@ -366,6 +416,7 @@ class RetrievalPipeline:
             top_k=top_k,
             filepath=filepath,
             project=project,
+            search_intent=search_intent,
         )
 
 
