@@ -59,11 +59,17 @@ class ParsedChunk:
     chunk_type: str  # file | declaration | function | class | method | section | statement
     symbol_name: str | None = None
     context: dict = field(default_factory=dict)
-    token_count: int = 0
+    _token_count: int = field(default=0, repr=False)
 
-    def __post_init__(self):
-        if self.token_count == 0:
-            self.token_count = len(_encoder.encode(self.text))
+    @property
+    def token_count(self) -> int:
+        if self._token_count == 0:
+            self._token_count = len(_encoder.encode(self.text))
+        return self._token_count
+
+    @token_count.setter
+    def token_count(self, value: int) -> None:
+        self._token_count = value
 
 
 # Language configuration
@@ -438,7 +444,7 @@ class CodeParser:
             chunk_type="file",
             symbol_name=Path(filepath).name,
             context={"filepath": filepath, "imports": imports[:5]},
-            token_count=token_count,
+            _token_count=token_count,
         )
 
     def _extract_declarations(
@@ -761,50 +767,40 @@ class CodeParser:
     def _split_large_chunk(
         self, chunk: ParsedChunk, max_tokens: int
     ) -> list[ParsedChunk]:
-        """Split a large chunk into smaller pieces."""
-        lines = chunk.text.split("\n")
+        """Split a large chunk into smaller pieces.
+
+        Encodes the full text once, splits the token array into slices
+        of max_tokens, and decodes each slice back to text.
+        """
+        all_tokens = _encoder.encode(chunk.text)
+
+        if len(all_tokens) <= max_tokens:
+            return [chunk]
+
         result = []
-        current_lines = []
-        current_tokens = 0
+        lines_consumed = 0
 
-        for i, line in enumerate(lines):
-            line_tokens = len(_encoder.encode(line))
+        for i in range(0, len(all_tokens), max_tokens):
+            token_slice = all_tokens[i : i + max_tokens]
+            text = _encoder.decode(token_slice)
 
-            if current_tokens + line_tokens > max_tokens and current_lines:
-                text = "\n".join(current_lines)
-                result.append(
-                    ParsedChunk(
-                        text=text,
-                        start_line=chunk.start_line + len(result) * len(current_lines),
-                        end_line=chunk.start_line
-                        + len(result) * len(current_lines)
-                        + len(current_lines)
-                        - 1,
-                        chunk_type=chunk.chunk_type,
-                        symbol_name=f"{chunk.symbol_name}_part{len(result) + 1}"
-                        if chunk.symbol_name
-                        else None,
-                        context=chunk.context,
-                    )
-                )
-                current_lines = [line]
-                current_tokens = line_tokens
-            else:
-                current_lines.append(line)
-                current_tokens += line_tokens
+            part_num = len(result) + 1
+            start_line = chunk.start_line + lines_consumed
+            new_lines = text.count("\n")
+            end_line = start_line + new_lines
+            lines_consumed += new_lines
 
-        if current_lines:
-            text = "\n".join(current_lines)
             result.append(
                 ParsedChunk(
                     text=text,
-                    start_line=chunk.start_line + len(result) * len(current_lines),
-                    end_line=chunk.end_line,
+                    start_line=start_line,
+                    end_line=end_line,
                     chunk_type=chunk.chunk_type,
-                    symbol_name=f"{chunk.symbol_name}_part{len(result) + 1}"
+                    symbol_name=f"{chunk.symbol_name}_part{part_num}"
                     if chunk.symbol_name
                     else None,
                     context=chunk.context,
+                    _token_count=len(token_slice),
                 )
             )
 
