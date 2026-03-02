@@ -39,12 +39,25 @@ TEST_CASES: list[dict] = [
     {"query": "GraphQL resolver that fetches user data", "best_intent": "implementation"},
     {"query": "unit test for payment processing", "best_intent": "usage"},
     {"query": "type definitions for API request and response", "best_intent": "definition"},
-    {"query": "caching strategy with Redis or in-memory cache", "best_intent": "implementation"},
+    {"query": "caching strategy with Redis or in-memory cache", "best_intent": "performance"},
     {"query": "file upload handling with multipart form data", "best_intent": "implementation"},
     {"query": "websocket connection management and event handling", "best_intent": "debug"},
+    {"query": "RBAC authorization checks for admin-only endpoints", "best_intent": "security"},
+    {"query": "sanitize user HTML before storing to prevent XSS", "best_intent": "security"},
+    {"query": "module boundary between queue engine and notification engine", "best_intent": "architecture"},
+    {"query": "where batching or N+1 query mitigation is implemented", "best_intent": "performance"},
 ]
 
-INTENTS = [None, "implementation", "definition", "usage", "debug"]
+INTENTS = [
+    None,
+    "implementation",
+    "definition",
+    "usage",
+    "debug",
+    "security",
+    "performance",
+    "architecture",
+]
 
 
 @dataclass

@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from code_context.config import get_settings
 from code_context.db.pool import DatabasePool, get_db_pool
 from code_context.embedding.voyage import VoyageClient, get_voyage_client
-from code_context.retrieval.pipeline import RetrievalPipeline
+from code_context.retrieval.pipeline import RetrievalPipeline, SearchIntent
 
 # Configure logging
 logging.basicConfig(
@@ -96,12 +96,14 @@ LITERATURE SEARCH:
 async def search_codebase(
     query: str,
     project: str,
-    top_k: int = 8,
     language: Literal["typescript", "javascript", "python", "java"] | None = None,
     chunk_type: Literal["function", "class", "method", "module"] | None = None,
     file_type: Literal["code", "docs", "all"] | None = None,
     directory: str | None = None,
-    search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
+    search_intent: SearchIntent | None = None,
+    max_tokens: int | None = None,
+    include_tests: bool = False,
+    max_file_chunks: int | None = 2,
     pipeline: RetrievalPipeline = Depends(get_pipeline),
 ) -> SearchResponse:
     """Semantic search across the indexed codebase.
@@ -114,7 +116,6 @@ async def search_codebase(
                "error handling in API routes", "user validation logic"
         project: Project ID from list_projects (e.g., "bingo-facil", "my-app").
                  This is REQUIRED. Use list_projects first to see available projects.
-        top_k: Maximum number of results to return (default: 8, max: 20)
         language: Optional filter by programming language
         chunk_type: Optional filter by code structure type
         file_type: "code" for code files only (ts, js, py, java, go, rust, sql),
@@ -127,23 +128,30 @@ async def search_codebase(
                    "definition" - types, interfaces, schemas, data structures
                    "usage" - call sites and integration examples
                    "debug" - error handling, logging, edge cases
+                   "security" - auth, permissions, validation, secret handling
+                   "performance" - hotspots, caching, batching, throughput
+                   "architecture" - module boundaries and orchestration paths
+        max_tokens: Optional token budget for this call (clamped to safe bounds).
+        include_tests: Include test/spec files in results (default: False).
+        max_file_chunks: Cap generic file-level chunks in final results (default: 2).
 
     Returns:
         SearchResponse with matching code chunks and pre-formatted context.
     """
-    top_k = min(top_k, 20)  # Cap at 20
-
-    logger.info(f"search_codebase: query='{query[:50]}...', project={project}, top_k={top_k}, file_type={file_type}, directory={directory}, intent={search_intent}")
+    logger.info(f"search_codebase: query='{query[:50]}...', project={project}, file_type={file_type}, directory={directory}, intent={search_intent}")
 
     results = await pipeline.search(
         query=query,
-        top_k=top_k,
         language=language,
         chunk_type=chunk_type,
         project=project,
         file_type=file_type,
         directory=directory,
         search_intent=search_intent,
+        max_tokens=max_tokens,
+        include_tests=include_tests,
+        max_file_chunks=max_file_chunks,
+        _tool_name="search_codebase",
     )
 
     chunks = [
@@ -171,8 +179,10 @@ async def search_by_file(
     filepath: str,
     query: str,
     project: str,
-    top_k: int = 5,
-    search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
+    search_intent: SearchIntent | None = None,
+    max_tokens: int | None = None,
+    include_tests: bool = False,
+    max_file_chunks: int | None = 2,
     pipeline: RetrievalPipeline = Depends(get_pipeline),
 ) -> SearchResponse:
     """Search within a specific file - useful for local refactoring.
@@ -186,26 +196,31 @@ async def search_by_file(
         query: What you're looking for within the file.
                Examples: "error handling", "validation logic", "main function"
         project: Project ID from list_projects (REQUIRED).
-        top_k: Maximum number of results (default: 5, max: 10)
         search_intent: Guides reranking toward a specific result type.
                    "implementation" - concrete code that builds the feature
                    "definition" - types, interfaces, schemas, data structures
                    "usage" - call sites and integration examples
                    "debug" - error handling, logging, edge cases
+                   "security" - auth, permissions, validation, secret handling
+                   "performance" - hotspots, caching, batching, throughput
+                   "architecture" - module boundaries and orchestration paths
+        max_tokens: Optional token budget for this call (clamped to safe bounds).
+        include_tests: Include test/spec files in results (default: False).
+        max_file_chunks: Cap generic file-level chunks in final results (default: 2).
 
     Returns:
         SearchResponse with matching code chunks from the specified file.
     """
-    top_k = min(top_k, 10)  # Cap at 10 for file-scoped search
-
     logger.info(f"search_by_file: filepath='{filepath}', query='{query[:50]}...', project={project}, intent={search_intent}")
 
     results = await pipeline.search_file(
         filepath=filepath,
         query=query,
-        top_k=top_k,
         project=project,
         search_intent=search_intent,
+        max_tokens=max_tokens,
+        include_tests=include_tests,
+        max_file_chunks=max_file_chunks,
     )
 
     chunks = [

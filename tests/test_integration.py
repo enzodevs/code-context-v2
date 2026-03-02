@@ -172,6 +172,7 @@ class TestDatabasePool:
                 file_hash="abc123",
                 language="typescript",
                 project_root="/test",
+                project_id="test",
                 last_indexed=datetime.now(),
                 loc=100,
             )
@@ -208,6 +209,7 @@ class TestDatabasePool:
                 file_hash="def456",
                 language="typescript",
                 project_root="/test",
+                project_id="test",
                 last_indexed=datetime.now(),
                 loc=50,
             )
@@ -304,6 +306,7 @@ class TestEndToEnd:
                 file_hash=compute_file_hash(TYPESCRIPT_CODE),
                 language="typescript",
                 project_root="/test",
+                project_id="test",
                 last_indexed=datetime.now(),
                 loc=TYPESCRIPT_CODE.count("\n") + 1,
             )

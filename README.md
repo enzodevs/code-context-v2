@@ -39,8 +39,8 @@ Claude Code ──MCP──▶ FastMCP Server
 **Retrieval pipeline:**
 1. Embed query with `voyage-4-lite` (fast, shared space with indexed docs)
 2. Vector search: top-50 candidates via cosine similarity (pgvector `<=>`)
-3. Rerank: `rerank-2.5` narrows to top-8 with relevance threshold
-4. Dedup: Jaccard similarity >95% removal
+3. Rerank: `rerank-2.5` + relative threshold (`max(score_floor, top_score * factor)`)
+4. Dedup: overlap/containment + Jaccard similarity filtering
 5. Return: Markdown-formatted chunks with file paths, line numbers, relevance scores
 
 ## Quick Start
@@ -117,6 +117,39 @@ Restart Claude Code. It will automatically discover the `search_codebase`, `sear
 | `list_books` | List indexed books (optional literature feature) |
 | `search_literature(query, book?)` | Search indexed technical books |
 
+`search_codebase` and `search_by_file` intentionally do not expose `top_k`: the server controls output size with `RERANK_TOP_K_OUTPUT` + `RESULT_MAX_TOKENS` for consistent responses across MCP clients.
+
+### Token-Efficient Controls
+
+Both `search_codebase` and `search_by_file` support optional output-shaping controls:
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `max_tokens` | `None` | Per-request budget override. Clamped to `[256, RESULT_MAX_TOKENS]`. |
+| `include_tests` | `false` | Excludes test/spec files by default for higher production-signal density. |
+| `max_file_chunks` | `2` | Caps generic `chunk_type=file` results to reduce large low-signal payloads. |
+
+Recommended defaults for agent clients:
+- Keep `include_tests=false` unless the user explicitly asks about tests.
+- Start with `max_tokens` between `1800` and `3200` for typical coding tasks.
+- Keep `max_file_chunks=2` and increase only when architectural context is missing.
+
+### Search Intent Guide
+
+Use `search_intent` to steer reranking precision:
+
+| Intent | Best for |
+|--------|----------|
+| `implementation` | Concrete runtime logic you will modify to ship a feature |
+| `definition` | Types/interfaces/schemas/contracts/config declarations |
+| `usage` | Call sites, integration points, consumer code |
+| `debug` | Error paths, retries, fallbacks, validation failures, observability clues |
+| `security` | Auth/authz, secret handling, sanitization, injection defenses |
+| `performance` | Hot paths, caching, batching, query shape, contention points |
+| `architecture` | Boundaries, adapters, orchestration, cross-module flow |
+
+Default intent is `implementation` when omitted.
+
 ## CLI
 
 ```bash
@@ -169,8 +202,11 @@ All settings via environment variables (or `.env` file):
 | `EMBEDDING_MODEL_INDEX` | `voyage-4-large` | Embedding model for indexing |
 | `EMBEDDING_MODEL_QUERY` | `voyage-4-lite` | Embedding model for queries |
 | `RERANK_MODEL` | `rerank-2.5` | Reranking model |
-| `RERANK_THRESHOLD` | `0.65` | Minimum relevance score after reranking |
+| `RERANK_TOP_K_OUTPUT` | `8` | Max final results returned by code search tools |
+| `RERANK_RELATIVE_FACTOR` | `0.75` | Relative cutoff factor (`threshold = top_score * factor`) |
+| `RERANK_SCORE_FLOOR` | `0.40` | Absolute minimum rerank score floor |
 | `RESULT_MAX_TOKENS` | `8000` | Token budget for results |
+| `SEARCH_LOG_PATH` | unset | Optional JSONL path for retrieval quality logs |
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 
 See `src/code_context/config.py` for all available settings.

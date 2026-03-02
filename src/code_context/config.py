@@ -35,9 +35,13 @@ class Settings(BaseSettings):
     rerank_model: str = "rerank-2.5"
     rerank_top_k_output: int = 8  # Max final results
 
-    # Phase 3: Filter + Budget
-    rerank_threshold: float = 0.65  # Restrictive threshold for precision (post-rerank)
+    # Phase 3: Relative threshold + Budget
+    rerank_relative_factor: float = 0.75  # threshold = top_score * factor
+    rerank_score_floor: float = 0.40  # Absolute minimum quality floor
     result_max_tokens: int = 8000  # Token budget for final context
+
+    # Quality logging (JSONL)
+    search_log_path: str | None = None  # Path to JSONL file. None = disabled
 
     # Chunking Config
     chunk_min_tokens: int = 30   # Keep small but meaningful functions

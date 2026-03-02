@@ -1,9 +1,12 @@
 """Retrieval pipeline: Vector search + Reranking + Deduplication + Formatting."""
 
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass
-from typing import Literal
+from pathlib import Path
+from typing import Literal, cast
 
 import tiktoken
 
@@ -24,6 +27,27 @@ _IMPORT_PATTERNS = [
     re.compile(r"^import\s+['\"](.+?)['\"]"),  # import "foo" (JS/TS)
     re.compile(r"^from\s+['\"](.+?)['\"]"),  # from "foo" (JS/TS)
 ]
+
+# Public search intents supported by MCP tools.
+SearchIntent = Literal[
+    "implementation",
+    "definition",
+    "usage",
+    "debug",
+    "security",
+    "performance",
+    "architecture",
+]
+
+_TEST_QUERY_PATTERN = re.compile(
+    r"\b(test|tests|spec|e2e|unit\s+test|integration\s+test|fixture|mock)\b",
+    re.IGNORECASE,
+)
+
+_TEST_FILE_PATH_PATTERN = re.compile(
+    r"(^|/)(__tests__|tests?)/|\.test\.[^/]+$|\.spec\.[^/]+$",
+    re.IGNORECASE,
+)
 
 
 def _extract_module_names(imports: list[str]) -> list[str]:
@@ -120,20 +144,22 @@ class RetrievalPipeline:
     async def search(
         self,
         query: str,
-        top_k: int | None = None,
         filepath: str | None = None,
         chunk_type: str | None = None,
         language: str | None = None,
         project: str | None = None,
         file_type: str | None = None,
         directory: str | None = None,
-        search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
+        search_intent: SearchIntent | None = None,
+        max_tokens: int | None = None,
+        include_tests: bool = False,
+        max_file_chunks: int | None = 2,
+        _tool_name: str | None = None,
     ) -> list[SearchResult]:
         """Execute the full retrieval pipeline.
 
         Args:
             query: Natural language search query
-            top_k: Number of results to return (default from settings)
             filepath: Filter to specific file
             chunk_type: Filter by chunk type (function, class, method)
             language: Filter by language
@@ -145,11 +171,36 @@ class RetrievalPipeline:
                 "definition" - types, interfaces, schemas
                 "usage" - call sites and integration examples
                 "debug" - error handling, logging, edge cases
+                "security" - auth, permissions, validation, secret handling
+                "performance" - hotspots, caching, batching, throughput
+                "architecture" - boundaries, orchestration, module contracts
+            max_tokens: Optional per-request token budget (clamped to safe bounds)
+            include_tests: Include test/spec files in final output (default: False)
+            max_file_chunks: Cap number of generic file-level chunks (default: 2)
+            _tool_name: Internal - tool name for quality logging
 
         Returns:
             List of SearchResult sorted by relevance (most relevant first)
         """
-        top_k = top_k or self.settings.rerank_top_k_output
+        t0 = time.monotonic()
+        max_results = self.settings.rerank_top_k_output
+        configured_max_tokens = self.settings.result_max_tokens
+        requested_max_tokens = max_tokens
+        effective_max_tokens = self._resolve_max_tokens(
+            requested_max_tokens,
+            configured_max_tokens,
+        )
+        effective_max_file_chunks = self._resolve_max_file_chunks(max_file_chunks)
+        sim_threshold = self.settings.similarity_threshold
+        phase0_count = 0
+        phase1_count = 0
+        resolved_intent = self._resolve_search_intent(search_intent)
+        query_mentions_tests = self._query_explicitly_mentions_tests(query)
+        file_chunks_selected = 0
+        file_chunks_dropped = 0
+        test_chunks_dropped = 0
+        test_filter_applied = not include_tests
+        test_filter_relaxed = False
 
         # Convert file_type to languages filter
         languages: list[str] | None = None
@@ -178,24 +229,101 @@ class RetrievalPipeline:
             languages=languages,
             directory=abs_directory,
         )
+        phase0_count = len(candidates)
 
         if not candidates:
+            duration_ms = int((time.monotonic() - t0) * 1000)
             logger.info(f"No candidates found for query: {query[:50]}...")
+            self._log_search_quality(
+                tool=_tool_name,
+                query=query,
+                project=project,
+                filepath=filepath,
+                chunk_type=chunk_type,
+                language=language,
+                file_type=file_type,
+                search_intent=resolved_intent,
+                directory=directory,
+                query_mentions_tests=query_mentions_tests,
+                outcome="no_candidates",
+                reason="vector_search_returned_empty",
+                phase0_candidates=phase0_count,
+                phase1_candidates=phase1_count,
+                sim_threshold=sim_threshold,
+                top_score=0.0,
+                threshold=0.0,
+                results=[],
+                result_token_counts=[],
+                cut=[],
+                total_tokens=0,
+                requested_max_tokens=requested_max_tokens,
+                effective_max_tokens=effective_max_tokens,
+                max_results=max_results,
+                deduplicated_count=0,
+                include_tests=include_tests,
+                max_file_chunks=effective_max_file_chunks,
+                file_chunks_selected=file_chunks_selected,
+                file_chunks_dropped=file_chunks_dropped,
+                test_chunks_dropped=test_chunks_dropped,
+                test_filter_applied=test_filter_applied,
+                test_filter_relaxed=test_filter_relaxed,
+                fallback_used=False,
+                token_budget_exhausted=False,
+                duration_ms=duration_ms,
+            )
             return []
 
         # Filter by similarity threshold (permissive, for recall)
-        sim_threshold = self.settings.similarity_threshold
         candidates = [c for c in candidates if c.similarity >= sim_threshold]
+        phase1_count = len(candidates)
 
         if not candidates:
+            duration_ms = int((time.monotonic() - t0) * 1000)
             logger.info(f"No candidates above similarity threshold {sim_threshold}")
+            self._log_search_quality(
+                tool=_tool_name,
+                query=query,
+                project=project,
+                filepath=filepath,
+                chunk_type=chunk_type,
+                language=language,
+                file_type=file_type,
+                search_intent=resolved_intent,
+                directory=directory,
+                query_mentions_tests=query_mentions_tests,
+                outcome="below_similarity_threshold",
+                reason=f"all_candidates_below_{sim_threshold:.2f}",
+                phase0_candidates=phase0_count,
+                phase1_candidates=phase1_count,
+                sim_threshold=sim_threshold,
+                top_score=0.0,
+                threshold=0.0,
+                results=[],
+                result_token_counts=[],
+                cut=[],
+                total_tokens=0,
+                requested_max_tokens=requested_max_tokens,
+                effective_max_tokens=effective_max_tokens,
+                max_results=max_results,
+                deduplicated_count=0,
+                include_tests=include_tests,
+                max_file_chunks=effective_max_file_chunks,
+                file_chunks_selected=file_chunks_selected,
+                file_chunks_dropped=file_chunks_dropped,
+                test_chunks_dropped=test_chunks_dropped,
+                test_filter_applied=test_filter_applied,
+                test_filter_relaxed=test_filter_relaxed,
+                fallback_used=False,
+                token_budget_exhausted=False,
+                duration_ms=duration_ms,
+            )
             return []
 
-        logger.debug(f"Phase 1: {len(candidates)} candidates above similarity {sim_threshold}")
+        logger.debug(f"Phase 1: {phase1_count} candidates above similarity {sim_threshold}")
 
         # ===== PHASE 2: Rerank with instruction-following =====
         documents = [c.chunk_text for c in candidates]
-        rerank_query = self._build_rerank_query(query, search_intent)
+        rerank_query = self._build_rerank_query(query, resolved_intent)
         rerank_results = await self.voyage.rerank(rerank_query, documents, top_k=len(candidates))
 
         # Map rerank results back to candidates
@@ -203,40 +331,78 @@ class RetrievalPipeline:
             (candidates[idx], score) for idx, score in rerank_results
         ]
 
-        # ===== PHASE 3: Adaptive threshold filtering =====
-        # Use adaptive threshold: min(config_threshold, top_score - margin)
-        # This ensures we always return results for difficult queries
+        # ===== PHASE 3: Relative threshold filtering =====
         top_score = reranked[0][1] if reranked else 0.0
-        margin = 0.25  # Allow results within 0.25 of top score
-        floor_threshold = 0.35  # Absolute minimum quality floor
+        threshold = max(
+            self.settings.rerank_score_floor,
+            top_score * self.settings.rerank_relative_factor,
+        )
 
-        adaptive_threshold = max(floor_threshold, min(self.settings.rerank_threshold, top_score - margin))
-        filtered = [(c, s) for c, s in reranked if s >= adaptive_threshold]
+        filtered = [(c, s) for c, s in reranked if s >= threshold]
+        cut = [(c, s) for c, s in reranked if s < threshold]
+        fallback_used = False
 
         if not filtered:
-            # Fallback: take top 3 results if nothing passes even the adaptive threshold
+            # Fallback: take top 3 results if nothing passes threshold
             filtered = reranked[:3]
-            logger.debug(f"No results above adaptive threshold {adaptive_threshold:.2f}, using top {len(filtered)}")
+            cut = reranked[3:]
+            fallback_used = True
+            logger.debug(f"No results above threshold {threshold:.2f}, using top {len(filtered)}")
 
         logger.debug(
-            f"Phase 3: {len(filtered)} results (adaptive threshold: {adaptive_threshold:.2f}, "
-            f"top_score: {top_score:.2f}, config: {self.settings.rerank_threshold})"
+            f"Phase 3: {len(filtered)} results (threshold: {threshold:.2f}, "
+            f"top_score: {top_score:.2f}, factor: {self.settings.rerank_relative_factor})"
         )
 
         # Stage 3: Deduplication (remove near-duplicates)
         deduplicated = self._deduplicate(filtered)
+        deduplicated_count = len(deduplicated)
 
-        # Stage 4: Format results with token budget
-        max_tokens = self.settings.result_max_tokens
+        # Stage 4: Optional test filtering + file chunk cap (token quality controls)
+        ranked_candidates = deduplicated
+        if test_filter_applied:
+            non_test_candidates = [
+                (chunk, score)
+                for chunk, score in ranked_candidates
+                if not self._is_test_file(chunk.filepath)
+            ]
+            test_chunks_dropped = len(ranked_candidates) - len(non_test_candidates)
+            ranked_candidates = non_test_candidates
+
+        ranked_candidates, file_chunks_selected, file_chunks_dropped = self._apply_file_chunk_cap(
+            ranked_candidates,
+            effective_max_file_chunks,
+        )
+
+        # Safety net: if filtering got too aggressive, relax test exclusion but keep file cap.
+        if not ranked_candidates and test_filter_applied and deduplicated:
+            test_filter_relaxed = True
+            ranked_candidates, file_chunks_selected, file_chunks_dropped = self._apply_file_chunk_cap(
+                deduplicated,
+                effective_max_file_chunks,
+            )
+            test_chunks_dropped = 0
+
+        # Stage 5: Format results with token budget
         current_tokens = 0
         results: list[SearchResult] = []
+        result_token_counts: list[int] = []
+        token_budget_exhausted = False
 
-        for chunk, score in deduplicated[:top_k]:
+        for chunk, score in ranked_candidates:
+            if len(results) >= max_results:
+                break
+
             # Estimate tokens for this chunk (text + formatting overhead ~50 tokens)
-            chunk_tokens = len(_encoder.encode(chunk.chunk_text)) + 50
+            text_tokens = len(_encoder.encode(chunk.chunk_text))
+            chunk_tokens = text_tokens + 50
 
-            if current_tokens + chunk_tokens > max_tokens:
-                logger.debug(f"Token budget reached ({current_tokens}/{max_tokens}), stopping at {len(results)} results")
+            if current_tokens + chunk_tokens > effective_max_tokens:
+                token_budget_exhausted = True
+                logger.debug(
+                    f"Token budget reached ({current_tokens}/{effective_max_tokens}), "
+                    f"stopping at {len(results)} results"
+                )
                 break
 
             results.append(SearchResult(
@@ -249,54 +415,230 @@ class RetrievalPipeline:
                 relevance_score=score,
                 context_metadata=chunk.context_metadata,
             ))
+            result_token_counts.append(text_tokens)
             current_tokens += chunk_tokens
 
         # Sort by relevance (most relevant first - primacy effect)
         results.sort(key=lambda r: r.relevance_score, reverse=True)
 
-        logger.debug(f"Returning {len(results)} results with ~{current_tokens} tokens")
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        logger.debug(f"Returning {len(results)} results with ~{current_tokens} tokens in {duration_ms}ms")
+
+        outcome = "ok" if results else "empty_after_budget"
+        reason = None
+        if outcome == "empty_after_budget":
+            if token_budget_exhausted:
+                reason = "first_chunk_exceeded_budget"
+            elif deduplicated_count and not ranked_candidates:
+                reason = "no_results_after_controls"
+            else:
+                reason = "no_results_after_dedup"
+
+        # Quality logging
+        self._log_search_quality(
+            tool=_tool_name,
+            query=query,
+            project=project,
+            filepath=filepath,
+            chunk_type=chunk_type,
+            language=language,
+            file_type=file_type,
+            search_intent=resolved_intent,
+            directory=directory,
+            query_mentions_tests=query_mentions_tests,
+            outcome=outcome,
+            reason=reason,
+            phase0_candidates=phase0_count,
+            phase1_candidates=phase1_count,
+            sim_threshold=sim_threshold,
+            top_score=top_score,
+            threshold=threshold,
+            results=results,
+            result_token_counts=result_token_counts,
+            cut=cut,
+            total_tokens=current_tokens,
+            requested_max_tokens=requested_max_tokens,
+            effective_max_tokens=effective_max_tokens,
+            max_results=max_results,
+            deduplicated_count=deduplicated_count,
+            include_tests=include_tests,
+            max_file_chunks=effective_max_file_chunks,
+            file_chunks_selected=file_chunks_selected,
+            file_chunks_dropped=file_chunks_dropped,
+            test_chunks_dropped=test_chunks_dropped,
+            test_filter_applied=test_filter_applied,
+            test_filter_relaxed=test_filter_relaxed,
+            fallback_used=fallback_used,
+            token_budget_exhausted=token_budget_exhausted,
+            duration_ms=duration_ms,
+        )
+
         return results
 
+    # Prompt version for quality-log traceability in A/B experiments.
+    RERANK_PROMPT_VERSION = "v2.1"
+
     # Mapping from search_intent to rerank instruction (Voyage rerank-2.5 instruction-following).
-    # Format follows Voyage/MongoDB recommendation: f"{instruction}\nQuery: {query}"
+    # Format follows Voyage recommendation: f"{instruction}\nRanking rules:\n...\nQuery: {query}"
     RERANK_INSTRUCTIONS: dict[str, str] = {
         "implementation": (
-            "Prioritize code that directly implements or defines the described functionality. "
-            "Prefer concrete implementations (functions, classes, methods) over imports, "
-            "type definitions, or indirect references."
+            "Prioritize code that directly implements the requested behavior and is likely to be edited "
+            "to deliver the feature. Prefer concrete runtime logic (services, handlers, orchestrators, "
+            "repositories with side effects) over broad references."
         ),
         "definition": (
-            "Prioritize type definitions, interfaces, schemas, data structures, and "
-            "configuration objects. Prefer declarations over usage examples."
+            "Prioritize canonical declarations: interfaces, types, schemas, enums, contracts, and "
+            "configuration structures that define data shape and constraints. Prefer definitions over usage."
         ),
         "usage": (
-            "Prioritize examples showing how this is called, imported, or integrated. "
-            "Prefer call sites and consumer code over the implementation itself."
+            "Prioritize call sites and integration points showing how the target is invoked, wired, "
+            "or consumed across modules. Prefer consumers over providers."
         ),
         "debug": (
-            "Prioritize error handling, logging, edge cases, retry logic, and "
-            "defensive code. Prefer code that handles failure scenarios."
+            "Prioritize failure-path code: error handling, retries, timeouts, fallbacks, guards, "
+            "validation failures, and observability signals that explain root cause propagation."
+        ),
+        "security": (
+            "Prioritize security-critical code: authentication, authorization, RBAC checks, token/session "
+            "handling, secret management, input validation/sanitization, and injection protections."
+        ),
+        "performance": (
+            "Prioritize performance-critical paths: hot loops, expensive I/O, query shape, batching, "
+            "caching, queue throughput, contention points, and memory-heavy transformations."
+        ),
+        "architecture": (
+            "Prioritize architectural boundaries and flow orchestration: module contracts, interfaces "
+            "between subsystems, adapters, factories, and cross-layer integration paths."
         ),
     }
 
-    # Default = implementation (wins 70% of queries in benchmarks)
+    INTENT_ALIASES: dict[str, str] = {
+        "impl": "implementation",
+        "types": "definition",
+        "schema": "definition",
+        "examples": "usage",
+        "calls": "usage",
+        "bugfix": "debug",
+        "troubleshoot": "debug",
+        "perf": "performance",
+        "speed": "performance",
+        "design": "architecture",
+        "arch": "architecture",
+        "authz": "security",
+        "auth": "security",
+    }
+
+    COMMON_RANKING_RULES: tuple[str, ...] = (
+        "Prefer chunks that directly answer the query over generic mentions.",
+        "Prefer symbol-scoped chunks (function/method/class/declaration) over generic file-level chunks "
+        "when both are relevant.",
+        "Penalize low-signal boilerplate and unrelated utilities.",
+    )
+
+    # Default intent remains implementation for backward compatibility.
     DEFAULT_RERANK_INSTRUCTION = RERANK_INSTRUCTIONS["implementation"]
+
+    @staticmethod
+    def _resolve_search_intent(search_intent: str | None) -> SearchIntent:
+        """Normalize/resolve search intent with safe defaulting."""
+        if not search_intent:
+            return "implementation"
+
+        normalized = search_intent.strip().lower()
+        normalized = RetrievalPipeline.INTENT_ALIASES.get(normalized, normalized)
+
+        if normalized in RetrievalPipeline.RERANK_INSTRUCTIONS:
+            return cast(SearchIntent, normalized)
+        return "implementation"
+
+    @staticmethod
+    def _query_explicitly_mentions_tests(query: str) -> bool:
+        """Heuristic: keep tests high only when query asks for tests explicitly."""
+        return _TEST_QUERY_PATTERN.search(query) is not None
+
+    @staticmethod
+    def _is_test_file(filepath: str) -> bool:
+        """Detect whether a file path is likely test/spec code."""
+        normalized = filepath.replace("\\", "/")
+        return _TEST_FILE_PATH_PATTERN.search(normalized) is not None
+
+    @staticmethod
+    def _resolve_max_tokens(
+        requested_max_tokens: int | None,
+        configured_max_tokens: int,
+    ) -> int:
+        """Resolve per-request token budget with safety clamps."""
+        if requested_max_tokens is None:
+            return configured_max_tokens
+
+        # Respect configured ceiling even when it's lower than the default floor.
+        if configured_max_tokens < 256:
+            return max(1, min(requested_max_tokens, configured_max_tokens))
+
+        return max(256, min(requested_max_tokens, configured_max_tokens))
+
+    @staticmethod
+    def _resolve_max_file_chunks(max_file_chunks: int | None) -> int | None:
+        """Resolve per-request cap for generic file-level chunks."""
+        if max_file_chunks is None:
+            return None
+        return max(0, max_file_chunks)
+
+    @staticmethod
+    def _apply_file_chunk_cap(
+        ranked_candidates: list[tuple[ChunkResult, float]],
+        max_file_chunks: int | None,
+    ) -> tuple[list[tuple[ChunkResult, float]], int, int]:
+        """Keep ranked order while limiting how many file-level chunks are returned."""
+        if max_file_chunks is None:
+            selected = sum(1 for chunk, _ in ranked_candidates if chunk.chunk_type == "file")
+            return ranked_candidates, selected, 0
+
+        kept: list[tuple[ChunkResult, float]] = []
+        selected = 0
+        dropped = 0
+        for chunk, score in ranked_candidates:
+            if chunk.chunk_type == "file":
+                if selected >= max_file_chunks:
+                    dropped += 1
+                    continue
+                selected += 1
+            kept.append((chunk, score))
+
+        return kept, selected, dropped
 
     @staticmethod
     def _build_rerank_query(
         query: str,
-        search_intent: str | None = None,
+        search_intent: SearchIntent | str | None = None,
     ) -> str:
         """Prepend a reranking instruction to the query.
 
         rerank-2.5 supports instruction-following: natural language instructions
         prepended to the query steer relevance scoring. Uses the Voyage-recommended
-        format: "{instruction}\\nQuery: {query}"
+        format: "{instruction}\\nRanking rules:\\n...\\nQuery: {query}".
         """
-        instruction = RetrievalPipeline.RERANK_INSTRUCTIONS.get(
-            search_intent or "", RetrievalPipeline.DEFAULT_RERANK_INSTRUCTION
-        )
-        return f"{instruction}\nQuery: {query}"
+        resolved_intent = RetrievalPipeline._resolve_search_intent(search_intent)
+        instruction = RetrievalPipeline.RERANK_INSTRUCTIONS[resolved_intent]
+
+        ranking_rules = list(RetrievalPipeline.COMMON_RANKING_RULES)
+
+        if not RetrievalPipeline._query_explicitly_mentions_tests(query):
+            ranking_rules.append(
+                "Deprioritize test/spec/fixture/mocked code unless no stronger production evidence exists."
+            )
+
+        if resolved_intent in {"definition", "architecture"}:
+            ranking_rules.append(
+                "Strongly prefer declarations and contracts over broad implementation bodies."
+            )
+        elif resolved_intent in {"usage", "debug"}:
+            ranking_rules.append(
+                "Prefer execution-path evidence (callers, handlers, orchestration paths) over static definitions."
+            )
+
+        rules_block = "\n".join(f"- {rule}" for rule in ranking_rules)
+        return f"{instruction}\nRanking rules:\n{rules_block}\nQuery: {query}"
 
     def _deduplicate(
         self,
@@ -399,13 +741,127 @@ class RetrievalPipeline:
 
         return intersection / union if union > 0 else 0.0
 
+    def _log_search_quality(
+        self,
+        *,
+        tool: str | None,
+        query: str,
+        project: str | None,
+        filepath: str | None,
+        chunk_type: str | None,
+        language: str | None,
+        file_type: str | None,
+        search_intent: str | None,
+        directory: str | None,
+        query_mentions_tests: bool,
+        outcome: str,
+        reason: str | None,
+        phase0_candidates: int,
+        phase1_candidates: int,
+        sim_threshold: float,
+        top_score: float,
+        threshold: float,
+        results: list[SearchResult],
+        result_token_counts: list[int],
+        cut: list[tuple[ChunkResult, float]],
+        total_tokens: int,
+        requested_max_tokens: int | None,
+        effective_max_tokens: int,
+        max_results: int,
+        deduplicated_count: int,
+        include_tests: bool,
+        max_file_chunks: int | None,
+        file_chunks_selected: int,
+        file_chunks_dropped: int,
+        test_chunks_dropped: int,
+        test_filter_applied: bool,
+        test_filter_relaxed: bool,
+        fallback_used: bool,
+        token_budget_exhausted: bool,
+        duration_ms: int,
+    ) -> None:
+        """Append a quality log entry to JSONL file (best-effort, never fails the search)."""
+        log_path = self.settings.search_log_path
+        if not log_path:
+            return
+
+        try:
+            entry = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "tool": tool,
+                "query": query,
+                "outcome": outcome,
+                "reason": reason,
+                "filters": {
+                    "project": project,
+                    "filepath": filepath,
+                    "chunk_type": chunk_type,
+                    "language": language,
+                    "file_type": file_type,
+                    "search_intent": search_intent,
+                    "directory": directory,
+                    "include_tests": include_tests,
+                    "query_mentions_tests": query_mentions_tests,
+                },
+                "retrieval": {
+                    "rerank_prompt_version": self.RERANK_PROMPT_VERSION,
+                    "phase0_candidates": phase0_candidates,
+                    "phase1_candidates": phase1_candidates,
+                    "similarity_threshold": round(sim_threshold, 4),
+                    "top_score": round(top_score, 4),
+                    "threshold": round(threshold, 4),
+                    "deduplicated_count": deduplicated_count,
+                    "test_filter_applied": test_filter_applied,
+                    "test_filter_relaxed": test_filter_relaxed,
+                    "test_chunks_dropped": test_chunks_dropped,
+                    "max_file_chunks": max_file_chunks,
+                    "file_chunks_selected": file_chunks_selected,
+                    "file_chunks_dropped": file_chunks_dropped,
+                    "fallback_used": fallback_used,
+                    "cut_count": len(cut),
+                    "cut_scores": [round(s, 4) for _, s in cut[:10]],
+                },
+                "budget": {
+                    "max_results": max_results,
+                    "requested_max_tokens": requested_max_tokens,
+                    "max_tokens": effective_max_tokens,
+                    "used_tokens": total_tokens,
+                    "returned_results": len(results),
+                    "token_budget_exhausted": token_budget_exhausted,
+                },
+                "results": [
+                    {
+                        "file": r.filepath,
+                        "symbol": r.symbol_name,
+                        "type": r.chunk_type,
+                        "lines": f"{r.start_line}-{r.end_line}",
+                        "score": round(r.relevance_score, 4),
+                        "tokens": (
+                            result_token_counts[i]
+                            if i < len(result_token_counts)
+                            else len(_encoder.encode(r.chunk_text))
+                        ),
+                    }
+                    for i, r in enumerate(results)
+                ],
+                "duration_ms": duration_ms,
+            }
+
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            logger.debug("Failed to write search quality log", exc_info=True)
+
     async def search_file(
         self,
         filepath: str,
         query: str,
-        top_k: int = 5,
         project: str | None = None,
-        search_intent: Literal["implementation", "definition", "usage", "debug"] | None = None,
+        search_intent: SearchIntent | None = None,
+        max_tokens: int | None = None,
+        include_tests: bool = False,
+        max_file_chunks: int | None = 2,
     ) -> list[SearchResult]:
         """Search within a specific file.
 
@@ -413,10 +869,13 @@ class RetrievalPipeline:
         """
         return await self.search(
             query=query,
-            top_k=top_k,
             filepath=filepath,
             project=project,
             search_intent=search_intent,
+            max_tokens=max_tokens,
+            include_tests=include_tests,
+            max_file_chunks=max_file_chunks,
+            _tool_name="search_by_file",
         )
 
 
