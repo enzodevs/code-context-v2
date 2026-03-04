@@ -75,15 +75,14 @@ class TestParser:
         self.parser = CodeParser()
 
     def test_parse_typescript_function(self):
-        """Small TS files should stay as a single file-level chunk."""
+        """Small TS files should still expose symbol-level chunks."""
         chunks = self.parser.parse_file("test.ts", TYPESCRIPT_CODE)
-        assert len(chunks) == 1, f"Expected 1 chunk for small file, got {len(chunks)}"
-        file_chunk = chunks[0]
-        assert file_chunk.chunk_type == "file"
-        assert file_chunk.symbol_name == "test.ts"
-        assert "export function validateEmail" in file_chunk.text
-        assert "filepath" in file_chunk.context
-        assert "imports" in file_chunk.context
+        assert len(chunks) >= 2, f"Expected symbol chunks for small file, got {len(chunks)}"
+        assert any(c.symbol_name == "validateEmail" and c.chunk_type == "function" for c in chunks)
+        assert any(c.symbol_name == "UserService" and c.chunk_type == "declaration" for c in chunks)
+        assert all("filepath" in c.context for c in chunks)
+        assert all("imports" in c.context for c in chunks)
+        assert all(c.chunk_type != "file" for c in chunks), "File chunk should be dropped when symbols exist"
 
     def test_parse_typescript_class(self):
         """Large TS files should include extracted symbols."""
@@ -101,13 +100,11 @@ class TestParser:
         assert any("export class UserService" in c.text for c in class_chunks)
 
     def test_parse_python_function(self):
-        """Small Python files should stay as a single file-level chunk."""
+        """Small Python files should prefer declarations over generic file chunks."""
         chunks = self.parser.parse_file("test.py", PYTHON_CODE)
-        assert len(chunks) == 1, f"Expected 1 chunk for small file, got {len(chunks)}"
-        file_chunk = chunks[0]
-        assert file_chunk.chunk_type == "file"
-        assert file_chunk.symbol_name == "test.py"
-        assert "class UserRepository" in file_chunk.text
+        assert len(chunks) >= 1, f"Expected at least one symbol chunk, got {len(chunks)}"
+        assert any(c.symbol_name == "UserRepository" and c.chunk_type == "declaration" for c in chunks)
+        assert all(c.chunk_type != "file" for c in chunks), "File chunk should be dropped when symbols exist"
 
     def test_parse_python_class(self):
         """Large Python files should expose declarations with symbol names."""

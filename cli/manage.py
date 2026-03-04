@@ -760,7 +760,7 @@ async def manage_watchers():
             print_info(f"PID: {pid}")
             print_info(f"Started: {watcher.get('started_at', 'unknown')}")
 
-            if gum_confirm(f"Stop this watcher?"):
+            if gum_confirm("Stop this watcher?"):
                 if stop_watcher_by_pid(pid):
                     print_success("Watcher stopped.")
                 else:
@@ -1181,7 +1181,7 @@ async def quick_sync_all():
             print(f"[{i}/{len(projects)}] {project_id} ({project_path})")
 
             if not Path(project_path).is_dir():
-                print(f"  ⚠ Path not found, skipping")
+                print("  ⚠ Path not found, skipping")
                 continue
 
             try:
@@ -1189,6 +1189,7 @@ async def quick_sync_all():
                     project_root=project_path,
                     project_id=project_id,
                     force=False,
+                    ensure_vector_index=False,
                 )
 
                 indexed = stats["indexed_files"]
@@ -1200,7 +1201,7 @@ async def quick_sync_all():
                 total_errors += errors
 
                 if indexed == 0 and deleted == 0:
-                    print(f"  ✓ Up to date")
+                    print("  ✓ Up to date")
                 else:
                     parts = []
                     if indexed > 0:
@@ -1214,6 +1215,10 @@ async def quick_sync_all():
             except Exception as e:
                 print(f"  ✗ Error: {e}")
                 total_errors += 1
+
+        if total_indexed > 0 or total_removed > 0:
+            print("\nEnsuring vector index (single pass)...")
+            await db.create_vector_index()
 
         print(f"\nDone: {total_indexed} indexed, {total_removed} removed, {total_errors} error(s)")
 

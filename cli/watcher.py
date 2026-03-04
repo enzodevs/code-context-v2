@@ -180,6 +180,7 @@ async def run_watcher(project_path: str, poll_interval: int = 30):
     await db.initialize()
     voyage = VoyageClient()
     indexer = Indexer(db, voyage)
+    await db.create_vector_index()
 
     # Get project_id from database (project must be indexed first)
     projects = await db.list_projects()
@@ -208,7 +209,12 @@ async def run_watcher(project_path: str, poll_interval: int = 30):
     # Initial sync to catch any changes before watcher started
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ⟳ Initial sync...", flush=True)
     try:
-        result = await indexer.index_project(str(path), project_id, force=False)
+        result = await indexer.index_project(
+            str(path),
+            project_id,
+            force=False,
+            ensure_vector_index=False,
+        )
         if result["indexed_files"] > 0:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] ⟳ Synced {result['indexed_files']} files ({result['total_chunks']} chunks)", flush=True)
         else:
@@ -452,6 +458,7 @@ class GlobalWatcherState:
     db: object  # DatabasePool
     indexer: object  # Indexer
     index_sem: asyncio.Semaphore
+    initial_sync_sem: asyncio.Semaphore | None = None
     known_files: dict[str, set[str]] = field(default_factory=dict)
     tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
@@ -483,10 +490,19 @@ async def _watch_single_project(
     state.known_files[project_id] = {str(p) for p, _ in collected}
     print(f"[{_ts()}] {tag} Tracking {len(state.known_files[project_id])} files", flush=True)
 
-    # Initial sync
+    # Initial sync (throttled by initial_sync_sem in global watcher)
     print(f"[{_ts()}] {tag} Initial sync...", flush=True)
     try:
-        result = await indexer.index_project(str(path), project_id, force=False)
+        sem = state.initial_sync_sem
+        coro = indexer.index_project(
+            str(path), project_id, force=False, ensure_vector_index=False,
+        )
+        if sem is not None:
+            async with sem:
+                result = await coro
+        else:
+            result = await coro
+
         indexed = result["indexed_files"]
         if indexed > 0:
             print(f"[{_ts()}] {tag} Synced {indexed} files ({result['total_chunks']} chunks)", flush=True)
@@ -632,6 +648,7 @@ async def run_global_watcher(poll_interval: int = 30, refresh_interval: int = 30
 
     db = DatabasePool(max_size=pool_max)
     await db.initialize()
+    await db.create_vector_index()
     voyage = VoyageClient()
     indexer = Indexer(db, voyage)
 
@@ -642,6 +659,9 @@ async def run_global_watcher(poll_interval: int = 30, refresh_interval: int = 30
         db=db,
         indexer=indexer,
         index_sem=asyncio.Semaphore(settings.index_concurrency),
+        initial_sync_sem=asyncio.Semaphore(
+            max(1, settings.global_watcher_initial_sync_concurrency)
+        ),
     )
 
     # Stagger startup: spread initial syncs across the poll interval

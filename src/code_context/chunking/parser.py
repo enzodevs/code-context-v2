@@ -349,7 +349,7 @@ class CodeParser:
                 tree.root_node, content, config["node_types"].get("import", set())
             )
 
-        # Check if this is a "small file" that shouldn't be fragmented
+        # Track whether this is a small file (used for file-chunk preference rules)
         line_count = content.count("\n") + 1
         is_small_file = line_count <= self.settings.small_file_lines
 
@@ -358,12 +358,7 @@ class CodeParser:
         if file_chunk:
             chunks.append(file_chunk)
 
-        # For small files, ONLY return the file-level chunk (no fragmentation)
-        if is_small_file and file_chunk:
-            logger.debug(f"Small file ({line_count} lines), keeping as single chunk: {filepath}")
-            return [file_chunk]  # Return early, no splitting
-
-        # Strategy-specific chunking (only for larger files)
+        # Strategy-specific chunking
         if strategy == "code":
             # Level 2: Declaration-level chunks
             declaration_chunks = self._extract_declarations(
@@ -414,6 +409,16 @@ class CodeParser:
             if text_hash not in seen_texts:
                 deduplicated.append(chunk)
                 seen_texts.add(text_hash)
+
+        # For small code files, prefer symbol-scoped chunks over generic file chunk
+        # whenever we extracted any declarations/functions/methods.
+        if strategy == "code" and is_small_file:
+            has_symbol_chunks = any(
+                c.chunk_type in {"declaration", "function", "method", "class"}
+                for c in deduplicated
+            )
+            if has_symbol_chunks:
+                deduplicated = [c for c in deduplicated if c.chunk_type != "file"]
 
         return deduplicated
 

@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     embedding_model_query: str = "voyage-4-lite"   # For query embeddings (shared space)
     embedding_dimensions: int = 1024
     embedding_batch_max_tokens: int = 100000  # Voyage limit is 120k, use 100k for safety
+    voyage_max_requests_per_minute: int = 1800  # Global request pacing guardrail
+    voyage_max_in_flight_requests: int = 8  # Global concurrent requests across embed/rerank
+    voyage_retry_max_attempts: int = 5
+    voyage_retry_base_delay_ms: int = 250
+    voyage_retry_max_delay_ms: int = 5000
+    voyage_retry_jitter_ms: int = 250
 
     # Two-Pass Retrieval Config
     # Phase 1: Vector Search (cast a wide net)
@@ -49,7 +55,8 @@ class Settings(BaseSettings):
     max_file_size_kb: int = 500  # Skip files larger than this (500KB)
     index_concurrency: int = 10  # Max concurrent files during indexing
     embedding_batch_concurrency: int = 3  # Max concurrent API batches per file
-    small_file_lines: int = 200  # Files with fewer lines are kept as single chunk (not fragmented)
+    small_file_lines: int = 200  # Below this: prefer symbol chunks, drop generic file chunk
+    global_watcher_initial_sync_concurrency: int = 1  # Limits parallel initial sync in watch-all
 
     # File type filter - languages considered "code" (vs docs/config)
     code_languages: tuple[str, ...] = (

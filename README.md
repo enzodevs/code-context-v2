@@ -201,6 +201,12 @@ All settings via environment variables (or `.env` file):
 | `VOYAGE_API_KEY` | — | Voyage AI API key (required) |
 | `EMBEDDING_MODEL_INDEX` | `voyage-4-large` | Embedding model for indexing |
 | `EMBEDDING_MODEL_QUERY` | `voyage-4-lite` | Embedding model for queries |
+| `VOYAGE_MAX_REQUESTS_PER_MINUTE` | `1800` | Global request pacing guardrail for Voyage API |
+| `VOYAGE_MAX_IN_FLIGHT_REQUESTS` | `8` | Global max concurrent Voyage API calls |
+| `VOYAGE_RETRY_MAX_ATTEMPTS` | `5` | Max retries for transient/rate-limit Voyage failures |
+| `VOYAGE_RETRY_BASE_DELAY_MS` | `250` | Initial exponential backoff delay |
+| `VOYAGE_RETRY_MAX_DELAY_MS` | `5000` | Retry delay ceiling |
+| `VOYAGE_RETRY_JITTER_MS` | `250` | Extra random jitter to avoid retry bursts |
 | `RERANK_MODEL` | `rerank-2.5` | Reranking model |
 | `RERANK_TOP_K_OUTPUT` | `8` | Max final results returned by code search tools |
 | `RERANK_RELATIVE_FACTOR` | `0.75` | Relative cutoff factor (`threshold = top_score * factor`) |
@@ -225,7 +231,7 @@ See `src/code_context/config.py` for all available settings.
 1. Walk the project tree (skips `node_modules`, `.git`, `dist`, etc.)
 2. Hash each file with BLAKE3 — skip unchanged files
 3. Parse with tree-sitter into semantic chunks (functions, classes, methods)
-4. Small files (<200 lines) are kept as single chunks to avoid fragmentation
+4. Small files (<200 lines) still extract symbol-level chunks; generic file chunks are dropped when symbol chunks exist
 5. Embed chunks with `voyage-4-large` in batches
 6. Store in PostgreSQL with pgvector embeddings
 7. All operations are atomic — Ctrl+C won't corrupt the index

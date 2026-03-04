@@ -52,15 +52,12 @@ CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON code_chunks(symbol_name) WHERE s
 CREATE OR REPLACE FUNCTION create_vector_index()
 RETURNS void AS $$
 BEGIN
-    -- Drop existing index if any
-    DROP INDEX IF EXISTS idx_chunks_embedding;
-
-    -- Create StreamingDiskANN index
-    EXECUTE 'CREATE INDEX idx_chunks_embedding ON code_chunks
+    -- Ensure StreamingDiskANN index exists (incremental-friendly)
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON code_chunks
         USING diskann (embedding)
         WITH (num_neighbors = 50, search_list_size = 100, max_alpha = 1.2)';
 
-    RAISE NOTICE 'Vector index created successfully';
+    RAISE NOTICE 'Vector index ensured successfully';
 END;
 $$ LANGUAGE plpgsql;
 

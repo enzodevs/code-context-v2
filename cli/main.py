@@ -102,6 +102,7 @@ async def cmd_index(args):
         return 1
 
     print_info(f"Indexing project: {path}")
+    project_id = path.name
 
     db = DatabasePool()
     await db.initialize()
@@ -110,7 +111,11 @@ async def cmd_index(args):
         voyage = VoyageClient()
         indexer = Indexer(db, voyage)
 
-        stats = await indexer.index_project(str(path), force=args.force)
+        stats = await indexer.index_project(
+            str(path),
+            project_id=project_id,
+            force=args.force,
+        )
 
         print()
         print_success(f"Indexed {stats['indexed_files']} files")
@@ -146,11 +151,20 @@ async def cmd_reindex(args):
 
         if path.is_dir():
             print_info(f"Force reindexing directory: {path}")
-            stats = await indexer.index_project(str(path), force=True)
+            stats = await indexer.index_project(
+                str(path),
+                project_id=path.name,
+                force=True,
+            )
             print_success(f"Reindexed {stats['indexed_files']} files")
         elif path.is_file():
             print_info(f"Force reindexing file: {path}")
-            result = await indexer.index_file(str(path), str(path.parent), force=True)
+            result = await indexer.index_file(
+                str(path),
+                str(path.parent),
+                project_id=path.parent.name,
+                force=True,
+            )
             if result["indexed"]:
                 print_success(f"Reindexed: {result['chunks']} chunks")
             else:

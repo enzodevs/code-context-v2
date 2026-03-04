@@ -9,6 +9,7 @@ from pathlib import Path
 
 from code_context.chunking.parser import (
     CodeParser,
+    ParsedChunk,
     compute_chunk_hash,
     compute_file_hash,
     detect_language,
@@ -121,6 +122,34 @@ class Indexer:
 
         return False
 
+    @staticmethod
+    def _build_embedding_text(chunk: ParsedChunk, language: str) -> str:
+        """Build a contextualized text representation for embedding.
+
+        Keeps original chunk text intact in storage/output, but prepends compact
+        structural context to improve semantic + identifier retrieval quality.
+        """
+        context = chunk.context or {}
+        filepath = context.get("filepath", "")
+        imports = context.get("imports", []) or []
+        parent_class = context.get("parent_class")
+
+        header_parts = [
+            f"filepath={filepath}",
+            f"language={language}",
+            f"chunk_type={chunk.chunk_type}",
+        ]
+
+        if chunk.symbol_name:
+            header_parts.append(f"symbol={chunk.symbol_name}")
+        if parent_class:
+            header_parts.append(f"parent_class={parent_class}")
+        if imports:
+            header_parts.append(f"imports={', '.join(imports[:5])}")
+
+        header = " | ".join(header_parts)
+        return f"[context] {header}\n{chunk.text}"
+
     def _collect_files(self, root: Path) -> list[tuple[Path, str]]:
         """Collect indexable files using os.walk with directory pruning.
 
@@ -150,6 +179,7 @@ class Indexer:
         project_root: str,
         project_id: str,
         force: bool = False,
+        ensure_vector_index: bool = True,
     ) -> dict:
         """Index all supported files in a project.
 
@@ -157,6 +187,7 @@ class Indexer:
             project_root: Root directory of the project
             project_id: Short identifier for the project (e.g., "my-app")
             force: If True, reindex all files regardless of hash
+            ensure_vector_index: If True, ensure vector index exists after changes
 
         Returns:
             Statistics about the indexing operation
@@ -183,13 +214,13 @@ class Indexer:
         # Remove stale files from DB (deleted from disk or now ignored)
         indexed_files = await self.db.get_project_files(project_id)
         stale_files = set(indexed_files.keys()) - disk_filepaths
-        for filepath in stale_files:
+        if stale_files:
             try:
-                await self.db.delete_file(filepath)
-                stats["deleted_files"] += 1
-                logger.info(f"Removed stale file: {filepath}")
+                deleted_count = await self.db.delete_files(sorted(stale_files))
+                stats["deleted_files"] = deleted_count
+                logger.info(f"Removed {deleted_count} stale files")
             except Exception as e:
-                logger.error(f"Error removing {filepath}: {e}")
+                logger.error(f"Error removing stale files: {e}")
 
         logger.info(
             f"Found {stats['total_files']} files to index in {project_root} (id: {project_id})"
@@ -208,6 +239,7 @@ class Indexer:
                         project_id=project_id,
                         language=language,
                         force=force,
+                        known_file_hash=indexed_files.get(str(path)),
                     )
                 except Exception as e:
                     logger.error(f"Error indexing {path}: {e}")
@@ -226,7 +258,7 @@ class Indexer:
                 stats["skipped_files"] += 1
 
         # Create vector index if we indexed anything
-        if stats["indexed_files"] > 0 or stats["deleted_files"] > 0:
+        if ensure_vector_index and (stats["indexed_files"] > 0 or stats["deleted_files"] > 0):
             try:
                 await self.db.create_vector_index()
             except Exception as e:
@@ -241,6 +273,7 @@ class Indexer:
         project_id: str,
         language: str | None = None,
         force: bool = False,
+        known_file_hash: str | None = None,
     ) -> dict:
         """Index a single file.
 
@@ -250,6 +283,7 @@ class Indexer:
             project_id: Short identifier for the project
             language: Language of the file (auto-detected if not provided)
             force: If True, reindex regardless of hash
+            known_file_hash: Optional preloaded hash from project scan to avoid per-file DB lookups
 
         Returns:
             Dict with indexing results
@@ -274,8 +308,12 @@ class Indexer:
         file_hash = compute_file_hash(content)
 
         # Check if file needs reindexing
-        existing = await self.db.get_file(filepath) if not force else None
-        if existing and existing.file_hash == file_hash:
+        existing_hash = known_file_hash
+        if not force and existing_hash is None:
+            existing = await self.db.get_file(filepath)
+            existing_hash = existing.file_hash if existing else None
+
+        if not force and existing_hash == file_hash:
             return {"indexed": False, "reason": "unchanged", "chunks": 0}
 
         # Parse file into chunks
@@ -290,7 +328,7 @@ class Indexer:
             return {"indexed": False, "reason": "no_chunks", "chunks": 0}
 
         # Generate embeddings for all chunks
-        texts = [chunk.text for chunk in parsed_chunks]
+        texts = [self._build_embedding_text(chunk, language) for chunk in parsed_chunks]
         embeddings = await self.voyage.embed_documents(texts, input_type="document")
 
         # Create chunk objects

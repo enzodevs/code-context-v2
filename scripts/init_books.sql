@@ -72,10 +72,9 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION create_book_vector_index()
 RETURNS void AS $$
 BEGIN
-    DROP INDEX IF EXISTS idx_book_chunks_embedding;
-    EXECUTE 'CREATE INDEX idx_book_chunks_embedding ON book_chunks
+    EXECUTE 'CREATE INDEX IF NOT EXISTS idx_book_chunks_embedding ON book_chunks
         USING diskann (embedding)
         WITH (num_neighbors = 50, search_list_size = 100, max_alpha = 1.2)';
-    RAISE NOTICE 'Book vector index created';
+    RAISE NOTICE 'Book vector index ensured';
 END;
 $$ LANGUAGE plpgsql;

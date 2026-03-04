@@ -115,6 +115,25 @@ class DatabasePool:
         async with self.acquire() as conn:
             await conn.execute("DELETE FROM code_files WHERE filepath = $1", filepath)
 
+    async def delete_files(self, filepaths: list[str]) -> int:
+        """Delete multiple files (and cascading chunks) in a single query."""
+        if not filepaths:
+            return 0
+
+        async with self.acquire() as conn:
+            deleted = await conn.fetchval(
+                """
+                WITH deleted AS (
+                    DELETE FROM code_files
+                    WHERE filepath = ANY($1::text[])
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM deleted
+                """,
+                filepaths,
+            )
+            return int(deleted or 0)
+
     # Chunk operations
     async def insert_chunks(self, chunks: list[CodeChunk]) -> None:
         """Bulk insert chunks."""
@@ -293,10 +312,19 @@ class DatabasePool:
             return stats
 
     async def create_vector_index(self) -> None:
-        """Create or recreate the vector index."""
+        """Ensure the vector index exists.
+
+        Uses IF NOT EXISTS to avoid expensive rebuilds during normal sync.
+        """
         async with self.acquire() as conn:
-            await conn.execute("SELECT create_vector_index()")
-            logger.info("Vector index created")
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON code_chunks
+                USING diskann (embedding)
+                WITH (num_neighbors = 50, search_list_size = 100, max_alpha = 1.2)
+                """
+            )
+            logger.info("Vector index ensured")
 
     # Project management operations
     async def list_projects(self) -> list[dict]:

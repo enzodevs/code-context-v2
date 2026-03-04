@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
-from typing import Literal
+import random
+import time
+from typing import Any, Callable, Literal
 
 import tiktoken
 import voyageai
@@ -38,6 +40,91 @@ class VoyageClient:
         self.dimensions = settings.embedding_dimensions
         self.batch_max_tokens = settings.embedding_batch_max_tokens
         self.batch_concurrency = settings.embedding_batch_concurrency
+        self.max_in_flight_requests = max(1, settings.voyage_max_in_flight_requests)
+        self.max_requests_per_minute = max(1, settings.voyage_max_requests_per_minute)
+        self.retry_max_attempts = max(1, settings.voyage_retry_max_attempts)
+        self.retry_base_delay_ms = max(1, settings.voyage_retry_base_delay_ms)
+        self.retry_max_delay_ms = max(self.retry_base_delay_ms, settings.voyage_retry_max_delay_ms)
+        self.retry_jitter_ms = max(0, settings.voyage_retry_jitter_ms)
+
+        self._request_sem = asyncio.Semaphore(self.max_in_flight_requests)
+        self._rate_lock = asyncio.Lock()
+        self._next_request_ts = 0.0
+        self._min_request_interval = 60.0 / float(self.max_requests_per_minute)
+
+    async def _throttle_request(self) -> None:
+        """Global in-process pacing guardrail for Voyage requests.
+
+        Assigns each request a time slot, then sleeps outside the lock
+        so other requests can schedule concurrently.
+        """
+        async with self._rate_lock:
+            now = time.monotonic()
+            delay = self._next_request_ts - now
+            self._next_request_ts = max(now, self._next_request_ts) + self._min_request_interval
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        """Best-effort retry classification without SDK-specific coupling."""
+        raw = str(exc).lower()
+        retry_markers = (
+            "429",
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "temporarily unavailable",
+            "service unavailable",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "server error",
+            "502",
+            "503",
+            "504",
+        )
+        if any(marker in raw for marker in retry_markers):
+            return True
+
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int):
+            return status_code == 429 or 500 <= status_code <= 504
+
+        return False
+
+    async def _call_with_retry(
+        self,
+        label: str,
+        fn: Callable[..., Any],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Execute Voyage SDK call with pacing + bounded retries."""
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with self._request_sem:
+                    await self._throttle_request()
+                    return await asyncio.to_thread(fn, *args, **kwargs)
+            except Exception as e:
+                is_retryable = self._is_retryable_error(e)
+                if attempt >= self.retry_max_attempts or not is_retryable:
+                    logger.error(f"{label} error (attempt {attempt}/{self.retry_max_attempts}): {e}")
+                    raise
+
+                backoff_ms = min(
+                    self.retry_max_delay_ms,
+                    self.retry_base_delay_ms * (2 ** (attempt - 1)),
+                )
+                jitter_ms = random.randint(0, self.retry_jitter_ms) if self.retry_jitter_ms else 0
+                sleep_ms = backoff_ms + jitter_ms
+                logger.warning(
+                    f"{label} retry {attempt}/{self.retry_max_attempts} after {sleep_ms}ms: {e}"
+                )
+                await asyncio.sleep(sleep_ms / 1000.0)
 
     async def embed_documents(
         self,
@@ -90,7 +177,8 @@ class VoyageClient:
 
         async def _embed_batch(idx: int, batch: list[str]) -> tuple[int, list[list[float]]]:
             async with sem:
-                result = await asyncio.to_thread(
+                result = await self._call_with_retry(
+                    "Embedding",
                     self.client.embed,
                     texts=batch,
                     model=model,
@@ -124,7 +212,8 @@ class VoyageClient:
         Compatible with voyage-4-large document embeddings (shared space).
         """
         try:
-            result = await asyncio.to_thread(
+            result = await self._call_with_retry(
+                "Query embedding",
                 self.client.embed,
                 texts=[query],
                 model=self.model_query,
@@ -157,7 +246,8 @@ class VoyageClient:
         top_k = top_k or settings.rerank_top_k_output
 
         try:
-            result = await asyncio.to_thread(
+            result = await self._call_with_retry(
+                "Reranking",
                 self.client.rerank,
                 query=query,
                 documents=documents,
