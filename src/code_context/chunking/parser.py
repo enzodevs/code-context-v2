@@ -60,6 +60,7 @@ class ParsedChunk:
     symbol_name: str | None = None
     context: dict = field(default_factory=dict)
     _token_count: int = field(default=0, repr=False)
+    _node: Node | None = field(default=None, repr=False, compare=False)
 
     @property
     def token_count(self) -> int:
@@ -354,7 +355,7 @@ class CodeParser:
         is_small_file = line_count <= self.settings.small_file_lines
 
         # Level 1: File-level chunk (complete file)
-        file_chunk = self._create_file_chunk(filepath, content, imports)
+        file_chunk = self._create_file_chunk(filepath, content, imports, tree.root_node)
         if file_chunk:
             chunks.append(file_chunk)
 
@@ -397,7 +398,11 @@ class CodeParser:
             if chunk.token_count < min_tokens:
                 continue
             if chunk.token_count > max_tokens:
-                filtered.extend(self._split_large_chunk(chunk, max_tokens))
+                if self.settings.ast_split_enabled:
+                    sub_chunks = self._split_chunk_structurally(chunk, max_tokens, language)
+                else:
+                    sub_chunks = self._split_large_chunk(chunk, max_tokens)
+                filtered.extend(c for c in sub_chunks if c.token_count >= min_tokens)
             else:
                 filtered.append(chunk)
 
@@ -423,7 +428,7 @@ class CodeParser:
         return deduplicated
 
     def _create_file_chunk(
-        self, filepath: str, content: str, imports: list[str]
+        self, filepath: str, content: str, imports: list[str], root_node: Node | None = None,
     ) -> ParsedChunk | None:
         """Create a file-level chunk for the complete file."""
         if not content.strip():
@@ -450,6 +455,7 @@ class CodeParser:
             symbol_name=Path(filepath).name,
             context={"filepath": filepath, "imports": imports[:5]},
             _token_count=token_count,
+            _node=root_node,
         )
 
     def _extract_declarations(
@@ -721,7 +727,13 @@ class CodeParser:
         return imports
 
     def _get_node_name(self, node: Node, name_field: str | None) -> str | None:
-        """Extract the name from a node."""
+        """Extract the name from a node.
+
+        For arrow functions / function expressions nested inside call_expression
+        (e.g. Convex ``export const foo = query({ handler: async () => {...} })``),
+        the name lives on an ancestor ``variable_declarator``, not on the function
+        node itself.  We walk up to 6 parent levels to find it.
+        """
         if not name_field:
             return None
 
@@ -732,6 +744,20 @@ class CodeParser:
         for child in node.children:
             if child.type == "identifier":
                 return child.text.decode("utf-8") if child.text else None
+
+        # Ancestry walk: arrow_function / function_expression inside a
+        # variable_declarator (possibly via call_expression, pair, object, etc.)
+        if node.type in {"arrow_function", "function_expression"}:
+            parent = node.parent
+            for _ in range(6):
+                if parent is None:
+                    break
+                if parent.type == "variable_declarator":
+                    vname = parent.child_by_field_name("name")
+                    if vname:
+                        return vname.text.decode("utf-8") if vname.text else None
+                    break
+                parent = parent.parent
 
         return None
 
@@ -760,6 +786,14 @@ class CodeParser:
         if parent_class:
             context["parent_class"] = parent_class
 
+        # Extract signature for functions/methods (text before the body block)
+        if chunk_type in ("function", "method"):
+            body = node.child_by_field_name("body")
+            if body:
+                sig = source[node.start_byte : body.start_byte].strip()
+                if sig:
+                    context["signature"] = sig
+
         return ParsedChunk(
             text=text,
             start_line=start_line,
@@ -767,7 +801,181 @@ class CodeParser:
             chunk_type=chunk_type,
             symbol_name=symbol_name,
             context=context,
+            _node=node,
         )
+
+    # Node types to skip when collecting structural children for splitting
+    _SKIP_NODE_TYPES = frozenset({
+        "comment", "block_comment", "line_comment", "{", "}", "(", ")", ";",
+        ",", ":", "=>", ".", "//", "/*", "*/",
+    })
+
+    def _split_chunk_structurally(
+        self,
+        chunk: ParsedChunk,
+        max_tokens: int,
+        language: str,
+        _depth: int = 0,
+    ) -> list[ParsedChunk]:
+        """Split an oversized chunk using AST structure instead of blind token slicing.
+
+        Strategy (3-level fallback):
+        1. If AST node available, split at structural children (statements, methods).
+        2. Recurse on oversized sub-groups (depth limit = 3).
+        3. Fall back to line-boundary splitting as last resort.
+        """
+        node = chunk._node
+        if node is None or _depth >= 3:
+            return self._split_by_lines(chunk, max_tokens)
+
+        # Get the node whose children we should split on.
+        # For functions/methods, we want the body's children (statements).
+        target = node
+        body = node.child_by_field_name("body")
+        if body is not None:
+            target = body
+
+        children = [
+            c for c in target.children
+            if c.type not in self._SKIP_NODE_TYPES and c.end_byte > c.start_byte
+        ]
+
+        if not children:
+            return self._split_by_lines(chunk, max_tokens)
+
+        # Extract the source text that corresponds to this chunk
+        source = chunk.text
+        source_offset = chunk._node.start_byte if chunk._node else 0
+
+        groups = self._group_children_by_budget(
+            children, source_offset, source, chunk, max_tokens,
+        )
+
+        result: list[ParsedChunk] = []
+        for group_chunk in groups:
+            if group_chunk.token_count > max_tokens:
+                result.extend(
+                    self._split_chunk_structurally(group_chunk, max_tokens, language, _depth + 1)
+                )
+            else:
+                result.append(group_chunk)
+        return result
+
+    def _group_children_by_budget(
+        self,
+        children: list[Node],
+        source_offset: int,
+        source: str,
+        parent_chunk: ParsedChunk,
+        max_tokens: int,
+    ) -> list[ParsedChunk]:
+        """Group adjacent AST children into chunks that fit within token budget."""
+        groups: list[ParsedChunk] = []
+        current_nodes: list[Node] = []
+        current_tokens = 0
+
+        for child in children:
+            child_text = source[child.start_byte - source_offset : child.end_byte - source_offset]
+            child_tokens = len(_encoder.encode(child_text))
+
+            if current_nodes and current_tokens + child_tokens > max_tokens:
+                group = self._nodes_to_chunk(
+                    current_nodes, source_offset, source, parent_chunk, current_tokens,
+                )
+                if group:
+                    groups.append(group)
+                current_nodes = []
+                current_tokens = 0
+
+            current_nodes.append(child)
+            current_tokens += child_tokens
+
+        if current_nodes:
+            group = self._nodes_to_chunk(
+                current_nodes, source_offset, source, parent_chunk, current_tokens,
+            )
+            if group:
+                groups.append(group)
+
+        return groups
+
+    def _nodes_to_chunk(
+        self,
+        nodes: list[Node],
+        source_offset: int,
+        source: str,
+        parent_chunk: ParsedChunk,
+        token_count: int,
+    ) -> ParsedChunk | None:
+        """Create a ParsedChunk from a group of adjacent AST nodes."""
+        if not nodes:
+            return None
+
+        start_byte = nodes[0].start_byte - source_offset
+        end_byte = nodes[-1].end_byte - source_offset
+        text = source[start_byte:end_byte]
+
+        if not text.strip():
+            return None
+
+        start_line = nodes[0].start_point[0] + 1
+        end_line = nodes[-1].end_point[0] + 1
+
+        symbol_name = parent_chunk.symbol_name
+
+        return ParsedChunk(
+            text=text,
+            start_line=start_line,
+            end_line=end_line,
+            chunk_type=parent_chunk.chunk_type,
+            symbol_name=symbol_name,
+            context=parent_chunk.context,
+            _token_count=token_count,
+            _node=nodes[0] if len(nodes) == 1 else None,
+        )
+
+    def _split_by_lines(
+        self, chunk: ParsedChunk, max_tokens: int
+    ) -> list[ParsedChunk]:
+        """Split a chunk at line boundaries (better than blind token split)."""
+        lines = chunk.text.split("\n")
+        result: list[ParsedChunk] = []
+        current_lines: list[str] = []
+        current_tokens = 0
+        lines_emitted = 0
+
+        def _emit():
+            nonlocal current_lines, current_tokens, lines_emitted
+            text = "\n".join(current_lines)
+            part_num = len(result) + 1
+            start_line = chunk.start_line + lines_emitted
+
+            result.append(ParsedChunk(
+                text=text,
+                start_line=start_line,
+                end_line=start_line + len(current_lines) - 1,
+                chunk_type=chunk.chunk_type,
+                symbol_name=f"{chunk.symbol_name}_part{part_num}" if chunk.symbol_name else None,
+                context=chunk.context,
+                _token_count=current_tokens,
+            ))
+            lines_emitted += len(current_lines)
+            current_lines = []
+            current_tokens = 0
+
+        for line in lines:
+            line_tokens = len(_encoder.encode(line))
+
+            if current_lines and current_tokens + line_tokens > max_tokens:
+                _emit()
+
+            current_lines.append(line)
+            current_tokens += line_tokens
+
+        if current_lines:
+            _emit()
+
+        return result if result else [chunk]
 
     def _split_large_chunk(
         self, chunk: ParsedChunk, max_tokens: int

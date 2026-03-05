@@ -1,0 +1,86 @@
+{
+  "project": "cardify",
+  "n_queries": 13,
+  "overall": {
+    "file_hit@1": 0.6153846153846154,
+    "file_hit@3": 0.9230769230769231,
+    "file_hit@5": 1.0,
+    "MRR": 0.7846153846153846,
+    "avg_score": 0.6971153846153846,
+    "avg_latency_ms": 720.0769230769231
+  },
+  "by_category": {
+    "identifier": {
+      "n": 2,
+      "file_hit@1": 1.0,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 1.0,
+      "avg_score": 0.759765625,
+      "avg_latency_ms": 1089.0
+    },
+    "semantic": {
+      "n": 2,
+      "file_hit@1": 0.5,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 0.75,
+      "avg_score": 0.734375,
+      "avg_latency_ms": 740.5
+    },
+    "debug": {
+      "n": 2,
+      "file_hit@1": 0.0,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 0.5,
+      "avg_score": 0.650390625,
+      "avg_latency_ms": 677.0
+    },
+    "architecture": {
+      "n": 2,
+      "file_hit@1": 1.0,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 1.0,
+      "avg_score": 0.6796875,
+      "avg_latency_ms": 623.5
+    },
+    "definition": {
+      "n": 2,
+      "file_hit@1": 0.5,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 0.75,
+      "avg_score": 0.705078125,
+      "avg_latency_ms": 644.0
+    },
+    "usage": {
+      "n": 1,
+      "file_hit@1": 0.0,
+      "file_hit@3": 0.0,
+      "file_hit@5": 1.0,
+      "MRR": 0.2,
+      "avg_score": 0.7265625,
+      "avg_latency_ms": 633.0
+    },
+    "performance": {
+      "n": 1,
+      "file_hit@1": 1.0,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 1.0,
+      "avg_score": 0.56640625,
+      "avg_latency_ms": 593.0
+    },
+    "security": {
+      "n": 1,
+      "file_hit@1": 1.0,
+      "file_hit@3": 1.0,
+      "file_hit@5": 1.0,
+      "MRR": 1.0,
+      "avg_score": 0.7109375,
+      "avg_latency_ms": 587.0
+    }
+  }
+}

@@ -829,6 +829,7 @@ async def global_stats():
 
     try:
         stats = await db.get_index_stats()
+        quality = await db.get_quality_stats()
 
         print()
         print(gum_style("Global Statistics", bold=True, foreground="212"))
@@ -853,8 +854,79 @@ async def global_stats():
                     print(f"    └─ method:      {data['methods']}")
                     print(f"    Avg tokens/chunk: {avg_tokens}")
 
+        # Quality indicators
+        if quality and quality.get("total_chunks", 0) > 0:
+            callable_count = quality["callable_chunks"]
+            sig_count = quality["with_signature"]
+            sig_pct = (sig_count / callable_count * 100) if callable_count else 0
+            file_pct = (quality["file_chunks"] / quality["total_chunks"] * 100)
+            print()
+            print(gum_style("Quality Indicators:", bold=True))
+            print(f"  Signature coverage:    {sig_count}/{callable_count} function+method ({sig_pct:.1f}%)")
+            print(f"  Tiny chunks (<30 tok): {quality['tiny_chunks']}")
+            print(f"  Oversized (>600 tok):  {quality['oversized_chunks']}")
+            print(f"  File chunk ratio:      {file_pct:.1f}%")
+
     finally:
         await db.close()
+
+
+async def interactive_analyze():
+    """Interactive analyze search quality logs."""
+    from code_context.config import get_settings
+    from scripts.analyze_logs import _load_entries, analyze
+
+    log_path = get_settings().search_log_path
+    if not log_path:
+        print_warning("SEARCH_LOG_PATH not configured in .env")
+        return
+
+    entries = _load_entries(log_path)
+    if not entries:
+        print_warning(f"No log entries found at {log_path}")
+        return
+
+    options = [
+        f"All ({len(entries)} queries)",
+        "Last 20",
+        "Last 50",
+        "Last 100",
+    ]
+    choice = gum_choose(options, header="How many queries to analyze?")
+    if not choice:
+        return
+
+    if "Last 20" in choice:
+        entries = entries[-20:]
+    elif "Last 50" in choice:
+        entries = entries[-50:]
+    elif "Last 100" in choice:
+        entries = entries[-100:]
+
+    analyze(entries)
+
+
+async def interactive_benchmark():
+    """Interactive benchmark — pick a project and run."""
+    from scripts.benchmark_retrieval import BENCHMARK_QUERIES
+
+    available = list(BENCHMARK_QUERIES.keys())
+    if not available:
+        print_warning("No benchmark queries defined.")
+        return
+
+    project_id = gum_choose(available, header="Select project to benchmark:")
+    if not project_id:
+        return
+
+    save_choice = gum_choose(["Just run", "Run and save baseline"], header="Save baseline?")
+    save_name = None
+    if save_choice and "save" in save_choice.lower():
+        save_name = gum_input("Baseline name (e.g. v1):")
+        if not save_name:
+            return
+
+    await quick_benchmark(project_id, save_name, None)
 
 
 async def main_menu():
@@ -892,6 +964,8 @@ async def main_menu():
             f"   {watcher_label}",
             "── Tools ───────────────────────────",
             "   📈  Global statistics",
+            "   📊  Analyze search quality",
+            "   🏁  Run benchmark",
             "   🧹  Prune orphaned chunks",
             "── Danger Zone ─────────────────────",
             "   🗑️   Delete project",
@@ -934,6 +1008,10 @@ async def main_menu():
                 await delete_project()
             elif "Global statistics" in choice:
                 await global_stats()
+            elif "Analyze search quality" in choice:
+                await interactive_analyze()
+            elif "Run benchmark" in choice:
+                await interactive_benchmark()
             elif "Prune orphaned" in choice:
                 await prune_orphans()
             elif "Reset database" in choice:
@@ -986,8 +1064,12 @@ Interactive mode (default):
     parser.add_argument("--stop-all-watchers", action="store_true", help="Stop all active watchers")
     parser.add_argument("--watch-all", action="store_true", help="Start global watcher for all projects")
     parser.add_argument("--stop-global", action="store_true", help="Stop the global watcher")
+    parser.add_argument("--analyze", action="store_true", help="Analyze search quality logs")
+    parser.add_argument("--benchmark", metavar="PROJECT", help="Run retrieval benchmark")
+    parser.add_argument("--save-baseline", metavar="NAME", help="Save benchmark as baseline")
+    parser.add_argument("--compare-baseline", metavar="NAME", help="Compare against baseline")
 
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
 
     # Non-interactive quick commands
     if args.list:
@@ -1028,6 +1110,12 @@ Interactive mode (default):
         return
     if args.stop_global:
         quick_stop_global_watcher()
+        return
+    if args.analyze:
+        quick_analyze(extra_args)
+        return
+    if args.benchmark:
+        asyncio.run(quick_benchmark(args.benchmark, args.save_baseline, args.compare_baseline))
         return
 
     # Interactive mode requires gum
@@ -1388,6 +1476,26 @@ def quick_stop_all_watchers():
         print(f"✓ Stopped watcher PID {w['pid']}: {label}")
 
     print(f"\n✓ Stopped {len(watchers)} watcher(s)")
+
+
+def quick_analyze(extra_args: list[str]):
+    """Quick non-interactive analyze command — delegates to scripts.analyze_logs."""
+    from scripts.analyze_logs import main as analyze_main
+
+    # Temporarily override sys.argv so argparse in analyze_logs works
+    import sys
+    original_argv = sys.argv
+    sys.argv = ["analyze_logs"] + extra_args
+    try:
+        analyze_main()
+    finally:
+        sys.argv = original_argv
+
+
+async def quick_benchmark(project_id: str, save_name: str | None, compare_name: str | None):
+    """Quick non-interactive benchmark command."""
+    from scripts.benchmark_retrieval import main_async
+    await main_async(project_id, save_name, compare_name)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@
 #   stop            Stop watcher for a project
 #   stop-all        Stop all watchers
 #   stop-global     Stop the global watcher
+#   analyze         Analyze search quality logs (JSONL)
+#   benchmark       Run retrieval benchmark for a project
 #
 # Examples:
 #   cc2                                    # Interactive menu
@@ -91,6 +93,10 @@ show_help() {
     echo "  cc2 delete my-proj                   # Delete project"
     echo "  cc2 watch ~/myproject                # Start watcher (single project)"
     echo "  cc2 watch-all                        # Start global watcher"
+    echo "  cc2 analyze [--last N] [--since DATE] # Analyze search quality logs"
+    echo "  cc2 benchmark PROJECT                # Run retrieval benchmark"
+    echo "  cc2 benchmark PROJECT --save v1      # Save baseline"
+    echo "  cc2 benchmark PROJECT --compare v1   # Compare vs baseline"
     echo ""
     echo "Pipeline: voyage-4-large (index) → voyage-4-lite (query) → rerank-2.5"
 }
@@ -226,6 +232,41 @@ cmd_stop_global() {
     run_cli --stop-global
 }
 
+cmd_analyze() {
+    run_cli --analyze "$@"
+}
+
+cmd_benchmark() {
+    local project_id="${1:-}"
+    shift 2>/dev/null || true
+    local args=()
+
+    if [[ -z "${project_id}" ]]; then
+        print_error "Project ID required. Usage: cc2 benchmark PROJECT [--save NAME] [--compare NAME]"
+        exit 1
+    fi
+
+    args+=(--benchmark "${project_id}")
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --save)
+                args+=(--save-baseline "$2")
+                shift 2
+                ;;
+            --compare)
+                args+=(--compare-baseline "$2")
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    run_cli "${args[@]}"
+}
+
 cmd_interactive() {
     if ! command -v gum >/dev/null 2>&1; then
         print_warn "gum not installed. Using text mode."
@@ -287,6 +328,12 @@ main() {
             ;;
         stop-global|--stop-global)
             cmd_stop_global
+            ;;
+        analyze|--analyze)
+            cmd_analyze "$@"
+            ;;
+        benchmark|--benchmark)
+            cmd_benchmark "$@"
             ;;
         *)
             print_error "Unknown command: ${cmd}"

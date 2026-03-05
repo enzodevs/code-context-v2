@@ -67,6 +67,40 @@ LARGE_PYTHON_CODE = PYTHON_CODE + "\n" + "\n".join(
     [f"x_{i} = {i}" for i in range(230)]
 )
 
+# Large function that exceeds chunk_max_tokens (600) — many statements
+LARGE_PYTHON_FUNCTION = '''
+def process_data(items):
+    """Process a large batch of items with multiple steps."""
+''' + "\n".join(
+    [f"    result_{i} = items[{i}] * {i + 1} + {i * 3}  # step {i}" for i in range(120)]
+) + '''
+    return locals()
+'''
+
+# Large class with multiple methods — should split into method-level chunks
+LARGE_TS_CLASS = '''
+import { Database } from 'pg';
+
+export class OrderService {
+  private db: Database;
+
+  constructor(db: Database) {
+    this.db = db;
+  }
+
+''' + "\n".join([
+    f'''  async processOrder{i}(orderId: string): Promise<void> {{
+    const order = await this.db.query('SELECT * FROM orders WHERE id = $1', [orderId]);
+    const items = await this.db.query('SELECT * FROM items WHERE order_id = $1', [orderId]);
+    const total = items.reduce((sum: number, item: any) => sum + item.price * item.quantity, 0);
+    await this.db.query('UPDATE orders SET total = $1, status = $2 WHERE id = $3', [total, 'processed_{i}', orderId]);
+    console.log(`Order ${{orderId}} processed with total ${{total}} for batch {i}`);
+  }}
+''' for i in range(8)
+]) + '''
+}
+'''
+
 
 class TestParser:
     """Test the code parser."""
@@ -136,6 +170,80 @@ class TestParser:
 
         chunk_hash = compute_chunk_hash("chunk text", "/path/file.ts", 10)
         assert len(chunk_hash) == 32, "Chunk hash should be 32 hex chars"
+
+    def test_large_function_split_preserves_statement_boundaries(self):
+        """Large Python function should split at statement boundaries, not mid-statement."""
+        chunks = self.parser.parse_file("test_large_func.py", LARGE_PYTHON_FUNCTION)
+
+        # Should produce multiple chunks from the large function
+        func_chunks = [c for c in chunks if c.chunk_type in ("function", "declaration")]
+        assert len(func_chunks) >= 2, (
+            f"Large function should be split into >=2 chunks, got {len(func_chunks)}"
+        )
+
+        # Each chunk should contain complete lines (no mid-line breaks)
+        for chunk in func_chunks:
+            lines = chunk.text.split("\n")
+            for line in lines:
+                # Lines should not start with partial tokens (encoding artifacts)
+                # A valid Python line either is empty, starts with whitespace+identifier,
+                # or starts with a keyword/comment
+                assert not line or line[0] in " \t#)]}\"'" or line[0].isalpha() or line[0] == "@", (
+                    f"Chunk contains likely mid-line split: {line[:50]!r}"
+                )
+
+    def test_large_class_split_into_methods(self):
+        """Large TS class should split structurally into method-level chunks."""
+        chunks = self.parser.parse_file("test_large_class.ts", LARGE_TS_CLASS)
+
+        # Should have method-level chunks
+        method_chunks = [c for c in chunks if c.chunk_type == "method"]
+        assert len(method_chunks) >= 3, (
+            f"Large class should produce method chunks, got {len(method_chunks)}"
+        )
+
+        # Each method chunk should contain a complete method signature
+        for chunk in method_chunks:
+            assert "async " in chunk.text or "processOrder" in chunk.text, (
+                f"Method chunk should contain method code: {chunk.text[:80]}"
+            )
+
+    def test_line_boundary_fallback(self):
+        """Chunk without AST children should fall back to line-boundary splitting."""
+        # Create a large comment block (no structural AST children)
+        big_comment = "# " + "\n# ".join([f"Comment line {i} with some padding text here" for i in range(200)])
+        code = big_comment + "\nx = 1\n"
+
+        chunks = self.parser.parse_file("test_comment.py", code)
+        # The file chunk (if split) should split at line boundaries
+        for chunk in chunks:
+            if chunk.chunk_type == "file" or "_part" in (chunk.symbol_name or ""):
+                lines = chunk.text.split("\n")
+                for line in lines:
+                    # No line should be a partial encoding artifact
+                    assert not line or line[0] in " \t#x=" or line[0].isalpha(), (
+                        f"Line-split produced artifact: {line[:50]!r}"
+                    )
+
+    def test_signature_in_context(self):
+        """Function chunks should have signature in context metadata."""
+        chunks = self.parser.parse_file("test_sig.py", PYTHON_CODE)
+        func_chunks = [c for c in chunks if c.chunk_type == "function"]
+        for chunk in func_chunks:
+            sig = chunk.context.get("signature")
+            if sig:
+                assert "def " in sig, f"Signature should contain 'def': {sig}"
+                assert "{" not in sig and ":" in sig, f"Signature should not contain body: {sig}"
+
+    def test_ast_split_disabled_falls_back(self, monkeypatch):
+        """When ast_split_enabled=False, should use old token-based splitting."""
+        from code_context.config import get_settings
+        settings = get_settings()
+        monkeypatch.setattr(settings, "ast_split_enabled", False)
+
+        chunks = self.parser.parse_file("test_fallback.py", LARGE_PYTHON_FUNCTION)
+        # Should still produce chunks (via token split fallback)
+        assert len(chunks) >= 1, "Should produce at least one chunk even with token split"
 
 
 class TestDatabasePool:

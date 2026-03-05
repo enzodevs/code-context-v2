@@ -267,6 +267,9 @@ class RetrievalPipeline:
                 test_chunks_dropped=test_chunks_dropped,
                 test_filter_applied=test_filter_applied,
                 test_filter_relaxed=test_filter_relaxed,
+                per_file_file_replaced=0,
+                per_file_symbol_capped=0,
+                per_file_budget_skipped=0,
                 fallback_used=False,
                 token_budget_exhausted=False,
                 duration_ms=duration_ms,
@@ -313,6 +316,9 @@ class RetrievalPipeline:
                 test_chunks_dropped=test_chunks_dropped,
                 test_filter_applied=test_filter_applied,
                 test_filter_relaxed=test_filter_relaxed,
+                per_file_file_replaced=0,
+                per_file_symbol_capped=0,
+                per_file_budget_skipped=0,
                 fallback_used=False,
                 token_budget_exhausted=False,
                 duration_ms=duration_ms,
@@ -383,11 +389,32 @@ class RetrievalPipeline:
             )
             test_chunks_dropped = 0
 
-        # Stage 5: Format results with token budget
+        # Stage 4b: Per-file controls (symbol prioritization + per-file symbol cap)
+        per_file_file_replaced = 0
+        per_file_symbol_capped = 0
+        if self.settings.hierarchical_assembly_enabled:
+            ranked_candidates, per_file_file_replaced, per_file_symbol_capped = (
+                self._apply_per_file_controls(
+                    ranked_candidates,
+                    self.settings.max_symbols_per_file,
+                )
+            )
+
+        # Stage 5: Format results with token budget (+ per-file token cap)
         current_tokens = 0
         results: list[SearchResult] = []
         result_token_counts: list[int] = []
         token_budget_exhausted = False
+        per_file_budget_skipped = 0
+
+        # Per-file token budget (bypass when all candidates share same filepath)
+        is_single_file = len({c.filepath for c, _ in ranked_candidates}) <= 1
+        use_per_file_budget = (
+            self.settings.hierarchical_assembly_enabled
+            and not is_single_file
+        )
+        file_token_budget = int(effective_max_tokens * self.settings.per_file_budget_ratio)
+        file_tokens: dict[str, int] = {}
 
         for chunk, score in ranked_candidates:
             if len(results) >= max_results:
@@ -404,6 +431,14 @@ class RetrievalPipeline:
                     f"stopping at {len(results)} results"
                 )
                 break
+
+            # Per-file token budget enforcement
+            if use_per_file_budget:
+                fp = chunk.filepath
+                if file_tokens.get(fp, 0) + chunk_tokens > file_token_budget:
+                    per_file_budget_skipped += 1
+                    continue
+                file_tokens[fp] = file_tokens.get(fp, 0) + chunk_tokens
 
             results.append(SearchResult(
                 filepath=chunk.filepath,
@@ -468,6 +503,9 @@ class RetrievalPipeline:
             test_chunks_dropped=test_chunks_dropped,
             test_filter_applied=test_filter_applied,
             test_filter_relaxed=test_filter_relaxed,
+            per_file_file_replaced=per_file_file_replaced,
+            per_file_symbol_capped=per_file_symbol_capped,
+            per_file_budget_skipped=per_file_budget_skipped,
             fallback_used=fallback_used,
             token_budget_exhausted=token_budget_exhausted,
             duration_ms=duration_ms,
@@ -606,6 +644,50 @@ class RetrievalPipeline:
             kept.append((chunk, score))
 
         return kept, selected, dropped
+
+    @staticmethod
+    def _apply_per_file_controls(
+        ranked_candidates: list[tuple[ChunkResult, float]],
+        max_symbols_per_file: int,
+    ) -> tuple[list[tuple[ChunkResult, float]], int, int]:
+        """Prioritize symbol chunks over file chunks and cap symbols per file.
+
+        Returns:
+            (filtered_candidates, file_chunks_replaced, symbols_capped)
+        """
+        # Bypass when all candidates share the same filepath (e.g. search_by_file)
+        unique_files = {c.filepath for c, _ in ranked_candidates}
+        if len(unique_files) <= 1:
+            return ranked_candidates, 0, 0
+
+        # Phase 1: If a file has both "file" and symbol chunks, drop the "file" chunk
+        files_with_symbols: set[str] = set()
+        for chunk, _ in ranked_candidates:
+            if chunk.chunk_type != "file":
+                files_with_symbols.add(chunk.filepath)
+
+        file_replaced = 0
+        after_symbol_priority: list[tuple[ChunkResult, float]] = []
+        for chunk, score in ranked_candidates:
+            if chunk.chunk_type == "file" and chunk.filepath in files_with_symbols:
+                file_replaced += 1
+                continue
+            after_symbol_priority.append((chunk, score))
+
+        # Phase 2: Cap symbols per file (preserve ranked order)
+        file_symbol_count: dict[str, int] = {}
+        symbols_capped = 0
+        result: list[tuple[ChunkResult, float]] = []
+        for chunk, score in after_symbol_priority:
+            fp = chunk.filepath
+            count = file_symbol_count.get(fp, 0)
+            if count >= max_symbols_per_file:
+                symbols_capped += 1
+                continue
+            file_symbol_count[fp] = count + 1
+            result.append((chunk, score))
+
+        return result, file_replaced, symbols_capped
 
     @staticmethod
     def _build_rerank_query(
@@ -776,6 +858,9 @@ class RetrievalPipeline:
         test_chunks_dropped: int,
         test_filter_applied: bool,
         test_filter_relaxed: bool,
+        per_file_file_replaced: int,
+        per_file_symbol_capped: int,
+        per_file_budget_skipped: int,
         fallback_used: bool,
         token_budget_exhausted: bool,
         duration_ms: int,
@@ -817,6 +902,9 @@ class RetrievalPipeline:
                     "max_file_chunks": max_file_chunks,
                     "file_chunks_selected": file_chunks_selected,
                     "file_chunks_dropped": file_chunks_dropped,
+                    "per_file_file_replaced": per_file_file_replaced,
+                    "per_file_symbol_capped": per_file_symbol_capped,
+                    "per_file_budget_skipped": per_file_budget_skipped,
                     "fallback_used": fallback_used,
                     "cut_count": len(cut),
                     "cut_scores": [round(s, 4) for _, s in cut[:10]],

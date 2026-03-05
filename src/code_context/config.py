@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     small_file_lines: int = 200  # Below this: prefer symbol chunks, drop generic file chunk
     global_watcher_initial_sync_concurrency: int = 1  # Limits parallel initial sync in watch-all
 
+    # AST-aware splitting (Phase A)
+    ast_split_enabled: bool = True  # False = fallback to token-only split
+
+    # Hierarchical context assembly (Phase B)
+    hierarchical_assembly_enabled: bool = True
+    per_file_budget_ratio: float = 0.45  # Max fraction of total budget per file
+    max_symbols_per_file: int = 5  # Max symbol-level chunks per file in results
+
     # File type filter - languages considered "code" (vs docs/config)
     code_languages: tuple[str, ...] = (
         "typescript", "javascript", "python", "java", "go", "rust", "sql"

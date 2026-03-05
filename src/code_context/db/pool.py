@@ -311,6 +311,34 @@ class DatabasePool:
                 }
             return stats
 
+    async def get_quality_stats(self, project_id: str | None = None) -> dict:
+        """Get chunk quality indicators (signature coverage, tiny/oversized counts)."""
+        async with self.acquire() as conn:
+            where = "WHERE f.project_id = $1" if project_id else ""
+            args: list = [project_id] if project_id else []
+
+            row = await conn.fetchrow(
+                f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE c.chunk_type IN ('function', 'method'))
+                        AS callable_chunks,
+                    COUNT(*) FILTER (
+                        WHERE c.chunk_type IN ('function', 'method')
+                        AND c.symbol_name IS NOT NULL
+                        AND c.symbol_name != ''
+                    ) AS with_signature,
+                    COUNT(*) FILTER (WHERE c.token_count < 30) AS tiny_chunks,
+                    COUNT(*) FILTER (WHERE c.token_count > 600) AS oversized_chunks,
+                    COUNT(*) FILTER (WHERE c.chunk_type = 'file') AS file_chunks,
+                    COUNT(*) AS total_chunks
+                FROM code_chunks c
+                JOIN code_files f ON c.filepath = f.filepath
+                {where}
+                """,
+                *args,
+            )
+            return dict(row) if row else {}
+
     async def create_vector_index(self) -> None:
         """Ensure the vector index exists.
 

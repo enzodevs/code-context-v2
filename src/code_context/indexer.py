@@ -59,6 +59,9 @@ DEFAULT_IGNORE_PATTERNS = {
     "storybook-static",
     ".docker",
     ".terraform",
+    ".cxx",
+    ".expo",
+    "Pods",
     "coverage",
     ".nyc_output",
     # Report/generated directories
@@ -146,6 +149,10 @@ class Indexer:
             header_parts.append(f"parent_class={parent_class}")
         if imports:
             header_parts.append(f"imports={', '.join(imports[:5])}")
+
+        signature = context.get("signature")
+        if signature:
+            header_parts.append(f"signature={signature}")
 
         header = " | ".join(header_parts)
         return f"[context] {header}\n{chunk.text}"
