@@ -1,7 +1,7 @@
 # SPEC — AST-Aware Chunking + Hierarchical Retrieval (+ Hybrid Optional)
 
 **Projeto:** `code-context-v2`
-**Status:** Fases A, B, C concluídas. Fases D, E pendentes.
+**Status:** Fases A, B, C, D concluídas. Fases E, F pendentes.
 **Última atualização:** 2026-03-05
 **Idioma da spec:** Português (termos técnicos em inglês)
 
@@ -26,7 +26,7 @@ Roadmap para elevar qualidade de retrieval sem inflar contexto inútil:
 | **A** | AST-aware chunking | **Concluída** | 2026-03-04 |
 | **B** | Hierarchical context assembly | **Concluída** | 2026-03-04 |
 | **C** | Observabilidade + benchmark | **Concluída** | 2026-03-05 |
-| **D** | Cross-file context assembly | Planejada | — |
+| **D** | Cross-file context assembly | **Concluída** | 2026-03-05 |
 | **E** | Parser multilíngue (Java/Rust) | Planejada | — |
 | **F** | Hybrid retrieval (BM25 + Dense) | Opcional | — |
 
@@ -127,11 +127,26 @@ OVERALL         0.62     0.92     1.00     0.79     0.70     637
 1. Ignore patterns: `.cxx`, `.expo`, `Pods` (removeu 152 files de build cache do index)
 2. Arrow function name extraction: `_get_node_name()` sobe até `variable_declarator` na AST
 
+### Phase D — Cross-File Context Assembly (concluída 2026-03-05)
+
+**Arquivos:** `src/code_context/retrieval/pipeline.py`, `src/code_context/db/pool.py`, `src/code_context/config.py`, `tests/test_retrieval_controls.py`
+
+1. Type reference extraction from `context_metadata` (signature + imports)
+2. PascalCase type name detection with builtin exclusion set (`_BUILTIN_TYPE_NAMES`)
+3. Named import parsing for JS/TS (`import { Foo } from '...'`) and Python (`from x import Foo`)
+4. Frequency-based prioritization (types referenced by multiple chunks rank higher)
+5. B-tree index lookup via `get_chunks_by_symbol_names()` — zero embedding/rerank calls
+6. Budget-aware inclusion: only when `tokens_used < 70%` of max budget
+7. Cap at `cross_file_max_chunks=3` per query
+8. `[Referenced Type]` tag in formatted output for cross-file context chunks
+9. Quality logging with `cross_file` section (refs_extracted, chunks_added, budget_skipped)
+10. 6 unit tests covering happy path, budget guard, dedup, cap, disabled, no-project
+
 ---
 
 ## 5. Fases Pendentes
 
-## Phase D — Cross-File Context Assembly
+## Phase D — Cross-File Context Assembly (Implementada)
 
 ### D.1 Objetivo
 
@@ -279,6 +294,9 @@ Ativar por default apenas se ganho mensurável em MRR >5% em benchmark E2E.
 | `result_max_tokens` | `8000` | Budget de tokens por query |
 | `chunk_min_tokens` | `30` | Mínimo para reter chunk |
 | `chunk_max_tokens` | `600` | Máximo antes de split |
+| `cross_file_assembly_enabled` | `true` | Phase D ativa |
+| `cross_file_max_chunks` | `3` | Max cross-file refs por query |
+| `cross_file_budget_threshold` | `0.70` | Só inclui se uso < 70% do budget |
 
 ---
 
@@ -300,7 +318,7 @@ Ativar por default apenas se ganho mensurável em MRR >5% em benchmark E2E.
 - [x] Benchmark com baseline salvo
 - [x] Arrow function name extraction (TS/JS)
 - [x] Ignore patterns para build cache (`.cxx`, `.expo`, `Pods`)
-- [ ] Phase D — Cross-file context assembly
+- [x] Phase D — Cross-file context assembly
 - [ ] Phase E — Parser Java/Rust
 - [ ] Phase F — Hybrid retrieval (se justificado por benchmark)
 

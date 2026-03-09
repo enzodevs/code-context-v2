@@ -4,7 +4,8 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
 
@@ -50,6 +51,92 @@ _TEST_FILE_PATH_PATTERN = re.compile(
 )
 
 
+# --- Phase D: Cross-file reference extraction ---
+
+# PascalCase identifiers in signatures (type names)
+_TYPE_NAME_RE = re.compile(r'\b([A-Z][A-Za-z0-9_]{1,})\b')
+
+# Named imports: JS/TS `import { Foo, Bar } from '...'` or `import type { Foo } from '...'`
+_JS_NAMED_IMPORT_RE = re.compile(r'import\s+(?:type\s+)?\{([^}]+)\}')
+
+# Python `from x import Foo, Bar`
+_PY_NAMED_IMPORT_RE = re.compile(r'from\s+\S+\s+import\s+(.+?)(?:\s*#|$)')
+
+_BUILTIN_TYPE_NAMES = frozenset({
+    # JS/TS builtins and utility types
+    'Promise', 'Array', 'Map', 'Set', 'Record', 'Partial', 'Required',
+    'Readonly', 'Pick', 'Omit', 'Exclude', 'Extract', 'ReturnType',
+    'String', 'Number', 'Boolean', 'Object', 'Function', 'Error',
+    'Date', 'RegExp', 'Symbol', 'BigInt', 'Iterator', 'AsyncIterator',
+    'Iterable', 'AsyncIterable', 'Generator', 'AsyncGenerator',
+    'Awaited', 'Parameters', 'ConstructorParameters', 'InstanceType',
+    'ThisParameterType', 'OmitThisParameter', 'NonNullable', 'Uppercase',
+    'Lowercase', 'Capitalize', 'Uncapitalize', 'Readonly',
+    'React', 'Component', 'FC', 'JSX', 'HTMLElement', 'Event',
+    # Python builtins and typing
+    'Dict', 'List', 'Tuple', 'Optional', 'Union', 'Any', 'Type',
+    'Callable', 'Awaitable', 'Coroutine', 'Sequence', 'Mapping',
+    'TypeVar', 'Generic', 'Protocol', 'ClassVar', 'Final',
+    'Literal', 'TypedDict', 'NamedTuple', 'BaseModel', 'Field',
+    'None', 'True', 'False', 'Enum', 'ABC', 'Self',
+    'Annotated', 'ParamSpec', 'TypeAlias', 'Override',
+})
+
+
+def _extract_type_refs_from_signature(signature: str) -> set[str]:
+    """Extract PascalCase type names from a function signature."""
+    return {m for m in _TYPE_NAME_RE.findall(signature) if m not in _BUILTIN_TYPE_NAMES}
+
+
+def _extract_imported_symbols(imports: list[str]) -> set[str]:
+    """Extract named symbols from import statements (JS/TS and Python)."""
+    symbols: set[str] = set()
+    for stmt in imports:
+        # JS/TS: import { Foo, Bar } from '...' or import type { Foo } from '...'
+        m = _JS_NAMED_IMPORT_RE.search(stmt)
+        if m:
+            for name in m.group(1).split(','):
+                name = name.strip()
+                # Handle `Foo as Bar` — use the original name
+                if ' as ' in name:
+                    name = name.split(' as ')[0].strip()
+                if name:
+                    symbols.add(name)
+            continue
+        # Python: from x import Foo, Bar
+        m = _PY_NAMED_IMPORT_RE.search(stmt)
+        if m:
+            for name in m.group(1).split(','):
+                name = name.strip()
+                if ' as ' in name:
+                    name = name.split(' as ')[0].strip()
+                # Skip wildcard
+                if name and name != '*':
+                    symbols.add(name)
+    return symbols
+
+
+def _extract_cross_file_refs(results: list['SearchResult']) -> list[str]:
+    """Extract referenced type names from search results, sorted by frequency.
+
+    Combines type references from signatures and imported symbols.
+    Higher-frequency references (used by multiple chunks) are prioritized.
+    """
+    freq: Counter[str] = Counter()
+    for r in results:
+        refs: set[str] = set()
+        sig = r.context_metadata.get("signature", "")
+        if sig:
+            refs |= _extract_type_refs_from_signature(sig)
+        imports = r.context_metadata.get("imports", [])
+        if imports:
+            refs |= _extract_imported_symbols(imports)
+        for ref in refs:
+            freq[ref] += 1
+    # Sort by frequency descending, then alphabetically for stability
+    return [name for name, _ in freq.most_common()]
+
+
 def _extract_module_names(imports: list[str]) -> list[str]:
     """Extract just module names from import statements.
 
@@ -92,6 +179,7 @@ class SearchResult:
     end_line: int
     relevance_score: float
     context_metadata: dict
+    is_cross_file_ref: bool = field(default=False)
 
     def format_for_context(self) -> str:
         """Format chunk for LLM context window.
@@ -102,7 +190,10 @@ class SearchResult:
         - Dependencies (imports)
         - The actual code
         """
-        header_parts = [f"File: {self.filepath}:{self.start_line}-{self.end_line}"]
+        header_parts = []
+        if self.is_cross_file_ref:
+            header_parts.append("[Referenced Type]")
+        header_parts.append(f"File: {self.filepath}:{self.start_line}-{self.end_line}")
 
         if self.symbol_name:
             header_parts.append(f"Symbol: {self.symbol_name}")
@@ -453,6 +544,17 @@ class RetrievalPipeline:
             result_token_counts.append(text_tokens)
             current_tokens += chunk_tokens
 
+        # Stage 5b: Cross-file context assembly (Phase D)
+        cross_file_log: dict = {"enabled": False}
+        if self.settings.cross_file_assembly_enabled and project:
+            cross_file_results, cross_file_tokens, cross_file_log = (
+                await self._assemble_cross_file_context(
+                    results, current_tokens, effective_max_tokens, project,
+                )
+            )
+            results.extend(cross_file_results)
+            current_tokens += cross_file_tokens
+
         # Sort by relevance (most relevant first - primacy effect)
         results.sort(key=lambda r: r.relevance_score, reverse=True)
 
@@ -509,6 +611,7 @@ class RetrievalPipeline:
             fallback_used=fallback_used,
             token_budget_exhausted=token_budget_exhausted,
             duration_ms=duration_ms,
+            cross_file=cross_file_log,
         )
 
         return results
@@ -689,6 +792,96 @@ class RetrievalPipeline:
 
         return result, file_replaced, symbols_capped
 
+    async def _assemble_cross_file_context(
+        self,
+        results: list[SearchResult],
+        current_tokens: int,
+        effective_max_tokens: int,
+        project: str,
+    ) -> tuple[list[SearchResult], int, dict]:
+        """Fetch cross-file type definitions referenced by ranked results.
+
+        Uses B-tree index lookup (no embedding/rerank calls) to find
+        declaration chunks for types referenced in signatures and imports.
+
+        Returns:
+            (additional_results, additional_tokens, log_info_dict)
+        """
+        log: dict = {"enabled": True, "refs_extracted": 0, "refs_queried": 0,
+                      "chunks_found": 0, "chunks_added": 0, "tokens_added": 0,
+                      "budget_skipped": False}
+
+        # Guard: budget threshold
+        budget_ratio = current_tokens / effective_max_tokens if effective_max_tokens > 0 else 1.0
+        if budget_ratio >= self.settings.cross_file_budget_threshold:
+            log["budget_skipped"] = True
+            return [], 0, log
+
+        # Extract referenced type names from results
+        ref_names = _extract_cross_file_refs(results)
+        log["refs_extracted"] = len(ref_names)
+        if not ref_names:
+            return [], 0, log
+
+        # Filter out symbols already present in results
+        existing_symbols = {r.symbol_name for r in results if r.symbol_name}
+        candidates = [n for n in ref_names if n not in existing_symbols]
+        log["refs_queried"] = len(candidates)
+        if not candidates:
+            return [], 0, log
+
+        # Exclude filepaths already in results to avoid intra-file overlap
+        existing_filepaths = list({r.filepath for r in results})
+
+        # DB lookup — B-tree index, no embedding
+        max_fetch = self.settings.cross_file_max_chunks * 2
+        db_chunks = await self.db.get_chunks_by_symbol_names(
+            symbol_names=candidates,
+            project_id=project,
+            exclude_filepaths=existing_filepaths,
+            chunk_types=["declaration", "class"],
+            limit=max_fetch,
+        )
+        log["chunks_found"] = len(db_chunks)
+        if not db_chunks:
+            return [], 0, log
+
+        # Dedup against existing results by (filepath, start_line, end_line)
+        existing_ranges = {(r.filepath, r.start_line, r.end_line) for r in results}
+
+        remaining_budget = effective_max_tokens - current_tokens
+        max_chunks = self.settings.cross_file_max_chunks
+        additional: list[SearchResult] = []
+        total_added_tokens = 0
+
+        for chunk in db_chunks:
+            if len(additional) >= max_chunks:
+                break
+            if (chunk.filepath, chunk.start_line, chunk.end_line) in existing_ranges:
+                continue
+
+            text_tokens = len(_encoder.encode(chunk.chunk_text))
+            chunk_tokens = text_tokens + 50
+            if total_added_tokens + chunk_tokens > remaining_budget:
+                break
+
+            additional.append(SearchResult(
+                filepath=chunk.filepath,
+                chunk_text=chunk.chunk_text,
+                chunk_type=chunk.chunk_type,
+                symbol_name=chunk.symbol_name,
+                start_line=chunk.start_line,
+                end_line=chunk.end_line,
+                relevance_score=0.0,
+                context_metadata=chunk.context_metadata,
+                is_cross_file_ref=True,
+            ))
+            total_added_tokens += chunk_tokens
+
+        log["chunks_added"] = len(additional)
+        log["tokens_added"] = total_added_tokens
+        return additional, total_added_tokens, log
+
     @staticmethod
     def _build_rerank_query(
         query: str,
@@ -864,6 +1057,7 @@ class RetrievalPipeline:
         fallback_used: bool,
         token_budget_exhausted: bool,
         duration_ms: int,
+        cross_file: dict | None = None,
     ) -> None:
         """Append a quality log entry to JSONL file (best-effort, never fails the search)."""
         log_path = self.settings.search_log_path
@@ -934,6 +1128,9 @@ class RetrievalPipeline:
                 ],
                 "duration_ms": duration_ms,
             }
+
+            if cross_file is not None:
+                entry["retrieval"]["cross_file"] = cross_file
 
             Path(log_path).parent.mkdir(parents=True, exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:

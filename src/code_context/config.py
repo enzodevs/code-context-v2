@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     per_file_budget_ratio: float = 0.45  # Max fraction of total budget per file
     max_symbols_per_file: int = 5  # Max symbol-level chunks per file in results
 
+    # Cross-file context assembly (Phase D)
+    cross_file_assembly_enabled: bool = True
+    cross_file_max_chunks: int = 3
+    cross_file_budget_threshold: float = 0.70  # Only add if usage < 70% of budget
+
     # File type filter - languages considered "code" (vs docs/config)
     code_languages: tuple[str, ...] = (
         "typescript", "javascript", "python", "java", "go", "rust", "sql"

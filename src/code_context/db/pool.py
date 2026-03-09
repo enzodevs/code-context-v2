@@ -282,6 +282,62 @@ class DatabasePool:
                 for row in rows
             ]
 
+    async def get_chunks_by_symbol_names(
+        self,
+        symbol_names: list[str],
+        project_id: str,
+        exclude_filepaths: list[str] | None = None,
+        chunk_types: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[ChunkResult]:
+        """Lookup chunks by exact symbol_name match (B-tree index).
+
+        Used by Phase D cross-file context assembly to fetch referenced
+        type definitions without any embedding or rerank calls.
+        """
+        if not symbol_names:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT c.id AS chunk_id, c.filepath, c.chunk_text, c.chunk_type,
+                       c.symbol_name, c.start_line, c.end_line, c.context_metadata,
+                       0.0::float AS similarity
+                FROM code_chunks c
+                JOIN code_files f ON c.filepath = f.filepath
+                WHERE c.symbol_name = ANY($1::text[])
+                  AND f.project_id = $2
+                  AND ($3::text[] IS NULL OR c.filepath != ALL($3::text[]))
+                  AND ($4::text[] IS NULL OR c.chunk_type = ANY($4::text[]))
+                ORDER BY c.token_count ASC
+                LIMIT $5
+                """,
+                symbol_names,
+                project_id,
+                exclude_filepaths,
+                chunk_types,
+                limit,
+            )
+            return [
+                ChunkResult(
+                    chunk_id=row["chunk_id"],
+                    filepath=row["filepath"],
+                    chunk_text=row["chunk_text"],
+                    chunk_type=row["chunk_type"],
+                    symbol_name=row["symbol_name"],
+                    start_line=row["start_line"],
+                    end_line=row["end_line"],
+                    context_metadata=(
+                        json.loads(row["context_metadata"])
+                        if isinstance(row["context_metadata"], str)
+                        else row["context_metadata"] or {}
+                    ),
+                    similarity=row["similarity"],
+                )
+                for row in rows
+            ]
+
     async def get_index_stats(self) -> dict:
         """Get indexing statistics."""
         async with self.acquire() as conn:

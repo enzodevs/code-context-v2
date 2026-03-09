@@ -12,14 +12,22 @@ from code_context.retrieval.pipeline import RetrievalPipeline
 
 
 class DummyDB:
-    def __init__(self, candidates: list[ChunkResult]):
+    def __init__(
+        self,
+        candidates: list[ChunkResult],
+        cross_file_chunks: list[ChunkResult] | None = None,
+    ):
         self._candidates = candidates
+        self._cross_file_chunks = cross_file_chunks or []
 
     async def get_project_root(self, _project_id: str) -> str:
         return "/repo"
 
     async def search_chunks(self, **_kwargs: Any) -> list[ChunkResult]:
         return self._candidates
+
+    async def get_chunks_by_symbol_names(self, **_kwargs: Any) -> list[ChunkResult]:
+        return self._cross_file_chunks
 
 
 class DummyVoyage:
@@ -43,6 +51,8 @@ def _make_chunk(
     chunk_type: str = "function",
     text: str | None = None,
     similarity: float = 0.9,
+    symbol_name: str | None = None,
+    context_metadata: dict | None = None,
 ) -> ChunkResult:
     payload = text or f"chunk_{chunk_id} unique tokens {chunk_id}"
     return ChunkResult(
@@ -50,10 +60,10 @@ def _make_chunk(
         filepath=filepath,
         chunk_text=payload,
         chunk_type=chunk_type,
-        symbol_name=f"symbol_{chunk_id}",
+        symbol_name=symbol_name if symbol_name is not None else f"symbol_{chunk_id}",
         start_line=chunk_id * 10,
         end_line=chunk_id * 10 + 5,
-        context_metadata={},
+        context_metadata=context_metadata or {},
         similarity=similarity,
     )
 
@@ -74,8 +84,11 @@ def build_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(settings, "rerank_top_k_output", 8)
     monkeypatch.setattr(settings, "result_max_tokens", 8000)
 
-    def _builder(candidates: list[ChunkResult]) -> tuple[RetrievalPipeline, Path]:
-        return RetrievalPipeline(DummyDB(candidates), DummyVoyage()), log_path
+    def _builder(
+        candidates: list[ChunkResult],
+        cross_file_chunks: list[ChunkResult] | None = None,
+    ) -> tuple[RetrievalPipeline, Path]:
+        return RetrievalPipeline(DummyDB(candidates, cross_file_chunks), DummyVoyage()), log_path
 
     return _builder
 
@@ -318,3 +331,219 @@ async def test_relaxes_test_filter_if_it_would_empty_results(build_pipeline):
     entry = _read_logs(log_path)[-1]
     assert entry["retrieval"]["test_filter_applied"] is True
     assert entry["retrieval"]["test_filter_relaxed"] is True
+
+
+# ===== Phase D: Cross-file context assembly =====
+
+
+@pytest.mark.asyncio
+async def test_cross_file_includes_referenced_types(build_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """When a returned chunk references a type, cross-file assembly includes its declaration."""
+    candidates = [
+        _make_chunk(
+            1, "/repo/src/balance.ts",
+            chunk_type="function",
+            symbol_name="getBalance",
+            context_metadata={
+                "signature": "async function getBalance(userId: string): Promise<UserStats>",
+                "imports": ["import { UserStats } from './schema'"],
+            },
+        ),
+    ]
+    cross_file = [
+        _make_chunk(
+            100, "/repo/src/schema.ts",
+            chunk_type="declaration",
+            symbol_name="UserStats",
+            text="export interface UserStats { balance: number; name: string; }",
+        ),
+    ]
+    pipeline, log_path = build_pipeline(candidates, cross_file)
+    monkeypatch.setattr(pipeline.settings, "cross_file_assembly_enabled", True)
+
+    results = await pipeline.search(
+        "getBalance function", project="test", include_tests=True, max_file_chunks=None,
+    )
+
+    # Should have the original result plus the cross-file ref
+    assert len(results) >= 2
+    cross_refs = [r for r in results if r.is_cross_file_ref]
+    assert len(cross_refs) == 1
+    assert cross_refs[0].symbol_name == "UserStats"
+    assert cross_refs[0].relevance_score == 0.0
+
+    entry = _read_logs(log_path)[-1]
+    cf = entry["retrieval"]["cross_file"]
+    assert cf["enabled"] is True
+    assert cf["chunks_added"] == 1
+    assert cf["refs_extracted"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_cross_file_respects_budget_threshold(build_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """Cross-file assembly skips when budget usage exceeds threshold."""
+    # Use a large chunk that consumes >70% of budget
+    big_text = "x " * 3000  # ~3000 tokens, well over 70% of 4000 budget
+    candidates = [
+        _make_chunk(
+            1, "/repo/src/big.ts",
+            chunk_type="function",
+            symbol_name="bigFunc",
+            text=big_text,
+            context_metadata={
+                "signature": "function bigFunc(): UserStats",
+                "imports": ["import { UserStats } from './schema'"],
+            },
+        ),
+    ]
+    cross_file = [
+        _make_chunk(100, "/repo/src/schema.ts", chunk_type="declaration", symbol_name="UserStats"),
+    ]
+    pipeline, log_path = build_pipeline(candidates, cross_file)
+    monkeypatch.setattr(pipeline.settings, "cross_file_assembly_enabled", True)
+    monkeypatch.setattr(pipeline.settings, "result_max_tokens", 4000)
+
+    results = await pipeline.search(
+        "big function", project="test", include_tests=True, max_file_chunks=None,
+    )
+
+    cross_refs = [r for r in results if r.is_cross_file_ref]
+    assert len(cross_refs) == 0
+
+    entry = _read_logs(log_path)[-1]
+    cf = entry["retrieval"]["cross_file"]
+    assert cf["budget_skipped"] is True
+
+
+@pytest.mark.asyncio
+async def test_cross_file_skips_already_present_symbols(build_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """Cross-file assembly does not duplicate symbols already in ranked results."""
+    candidates = [
+        _make_chunk(
+            1, "/repo/src/balance.ts",
+            chunk_type="function",
+            symbol_name="getBalance",
+            context_metadata={
+                "signature": "function getBalance(): UserStats",
+                "imports": ["import { UserStats } from './schema'"],
+            },
+        ),
+        # UserStats is ALREADY in the ranked results
+        _make_chunk(
+            2, "/repo/src/schema.ts",
+            chunk_type="declaration",
+            symbol_name="UserStats",
+            text="export interface UserStats { balance: number; }",
+        ),
+    ]
+    cross_file = [
+        _make_chunk(100, "/repo/src/schema.ts", chunk_type="declaration", symbol_name="UserStats"),
+    ]
+    pipeline, log_path = build_pipeline(candidates, cross_file)
+    monkeypatch.setattr(pipeline.settings, "cross_file_assembly_enabled", True)
+
+    results = await pipeline.search(
+        "getBalance function", project="test", include_tests=True, max_file_chunks=None,
+    )
+
+    cross_refs = [r for r in results if r.is_cross_file_ref]
+    assert len(cross_refs) == 0
+
+    entry = _read_logs(log_path)[-1]
+    cf = entry["retrieval"]["cross_file"]
+    assert cf["refs_queried"] == 0  # Filtered out because already present
+
+
+@pytest.mark.asyncio
+async def test_cross_file_respects_max_chunks_cap(build_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """Cross-file assembly caps at cross_file_max_chunks."""
+    candidates = [
+        _make_chunk(
+            1, "/repo/src/service.ts",
+            chunk_type="function",
+            symbol_name="processAll",
+            context_metadata={
+                "signature": "function processAll(): TypeA & TypeB & TypeC & TypeD & TypeE",
+                "imports": [],
+            },
+        ),
+    ]
+    cross_file = [
+        _make_chunk(100 + i, f"/repo/src/types_{i}.ts", chunk_type="declaration",
+                    symbol_name=name, text=f"export interface {name} {{ id: number; }}")
+        for i, name in enumerate(["TypeA", "TypeB", "TypeC", "TypeD", "TypeE"])
+    ]
+    pipeline, log_path = build_pipeline(candidates, cross_file)
+    monkeypatch.setattr(pipeline.settings, "cross_file_assembly_enabled", True)
+    monkeypatch.setattr(pipeline.settings, "cross_file_max_chunks", 2)
+
+    results = await pipeline.search(
+        "processAll function", project="test", include_tests=True, max_file_chunks=None,
+    )
+
+    cross_refs = [r for r in results if r.is_cross_file_ref]
+    assert len(cross_refs) == 2
+
+    entry = _read_logs(log_path)[-1]
+    assert entry["retrieval"]["cross_file"]["chunks_added"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cross_file_disabled_config(build_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """Cross-file assembly does nothing when disabled."""
+    candidates = [
+        _make_chunk(
+            1, "/repo/src/balance.ts",
+            chunk_type="function",
+            symbol_name="getBalance",
+            context_metadata={
+                "signature": "function getBalance(): UserStats",
+                "imports": ["import { UserStats } from './schema'"],
+            },
+        ),
+    ]
+    cross_file = [
+        _make_chunk(100, "/repo/src/schema.ts", chunk_type="declaration", symbol_name="UserStats"),
+    ]
+    pipeline, log_path = build_pipeline(candidates, cross_file)
+    monkeypatch.setattr(pipeline.settings, "cross_file_assembly_enabled", False)
+
+    results = await pipeline.search(
+        "getBalance function", project="test", include_tests=True, max_file_chunks=None,
+    )
+
+    cross_refs = [r for r in results if r.is_cross_file_ref]
+    assert len(cross_refs) == 0
+
+    entry = _read_logs(log_path)[-1]
+    cf = entry["retrieval"]["cross_file"]
+    assert cf["enabled"] is False
+    assert cf.get("chunks_added", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_cross_file_no_project(build_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """Cross-file assembly skips when no project is specified."""
+    candidates = [
+        _make_chunk(
+            1, "/repo/src/balance.ts",
+            chunk_type="function",
+            symbol_name="getBalance",
+            context_metadata={
+                "signature": "function getBalance(): UserStats",
+                "imports": ["import { UserStats } from './schema'"],
+            },
+        ),
+    ]
+    cross_file = [
+        _make_chunk(100, "/repo/src/schema.ts", chunk_type="declaration", symbol_name="UserStats"),
+    ]
+    pipeline, log_path = build_pipeline(candidates, cross_file)
+    monkeypatch.setattr(pipeline.settings, "cross_file_assembly_enabled", True)
+
+    results = await pipeline.search(
+        "getBalance function", project=None, include_tests=True, max_file_chunks=None,
+    )
+
+    cross_refs = [r for r in results if r.is_cross_file_ref]
+    assert len(cross_refs) == 0
