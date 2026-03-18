@@ -1,303 +1,36 @@
-"""AST-based hierarchical code parser using tree-sitter for multiple languages.
+"""AST-based hierarchical code parser using tree-sitter.
 
 Implements 3-level hierarchical chunking:
 1. file-level: Complete file for broad context
 2. declaration-level: Top-level exports/declarations (const, class, interface)
 3. function-level: Individual functions/methods for precise retrieval
-
-Supported languages:
-- TypeScript/JavaScript (.ts, .tsx, .js, .jsx, .mjs, .cjs)
-- Python (.py, .pyi)
-- Java (.java)
-- Go (.go)
-- Rust (.rs)
-- SQL (.sql)
-- Markdown (.md, .mdx)
-- JSON (.json)
-- YAML (.yml, .yaml)
-- TOML (.toml)
-- CSS (.css, .scss, .less)
-- HTML (.html, .htm)
 """
 
 import logging
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import blake3
-import tiktoken
-import tree_sitter_css as ts_css
-import tree_sitter_go as ts_go
-import tree_sitter_html as ts_html
-import tree_sitter_java as ts_java
-import tree_sitter_javascript as ts_javascript
-import tree_sitter_json as ts_json
-import tree_sitter_markdown as ts_markdown
-import tree_sitter_python as ts_python
-import tree_sitter_rust as ts_rust
-import tree_sitter_sql as ts_sql
-import tree_sitter_toml as ts_toml
-import tree_sitter_typescript as ts_typescript
-import tree_sitter_yaml as ts_yaml
-from tree_sitter import Language, Parser, Node
+from tree_sitter import Node, Parser
 
+from code_context.chunking.languages import LANGUAGE_CONFIG, detect_language
+from code_context.chunking.models import (
+    ParsedChunk,
+    _encoder,
+    compute_chunk_hash,
+    compute_file_hash,
+)
 from code_context.config import get_settings
 
 logger = logging.getLogger(__name__)
-
-# Token encoder for counting
-_encoder = tiktoken.get_encoding("cl100k_base")
-
-
-@dataclass
-class ParsedChunk:
-    """A parsed code chunk with metadata."""
-
-    text: str
-    start_line: int
-    end_line: int
-    chunk_type: str  # file | declaration | function | class | method | section | statement
-    symbol_name: str | None = None
-    context: dict = field(default_factory=dict)
-    _token_count: int = field(default=0, repr=False)
-    _node: Node | None = field(default=None, repr=False, compare=False)
-
-    @property
-    def token_count(self) -> int:
-        if self._token_count == 0:
-            self._token_count = len(_encoder.encode(self.text))
-        return self._token_count
-
-    @token_count.setter
-    def token_count(self, value: int) -> None:
-        self._token_count = value
-
-
-# Language configuration
-LANGUAGE_CONFIG = {
-    "typescript": {
-        "extensions": {".ts", ".tsx"},
-        "language": Language(ts_typescript.language_typescript()),
-        "node_types": {
-            "function": {
-                "function_declaration",
-                "arrow_function",
-                "function_expression",
-                "generator_function_declaration",
-            },
-            "class": {"class_declaration"},
-            "method": {"method_definition", "public_field_definition"},
-            "import": {"import_statement"},
-            "declaration": {
-                "export_statement",
-                "lexical_declaration",
-                "variable_declaration",
-                "class_declaration",
-                "function_declaration",
-                "interface_declaration",
-                "type_alias_declaration",
-                "enum_declaration",
-            },
-        },
-        "name_field": "name",
-    },
-    "javascript": {
-        "extensions": {".js", ".jsx", ".mjs", ".cjs"},
-        "language": Language(ts_javascript.language()),
-        "node_types": {
-            "function": {
-                "function_declaration",
-                "arrow_function",
-                "function_expression",
-                "generator_function_declaration",
-            },
-            "class": {"class_declaration"},
-            "method": {"method_definition"},
-            "import": {"import_statement"},
-            "declaration": {
-                "export_statement",
-                "lexical_declaration",
-                "variable_declaration",
-                "class_declaration",
-                "function_declaration",
-            },
-        },
-        "name_field": "name",
-    },
-    "python": {
-        "extensions": {".py", ".pyi"},
-        "language": Language(ts_python.language()),
-        "node_types": {
-            "function": {"function_definition"},
-            "class": {"class_definition"},
-            "method": {"function_definition"},
-            "import": {"import_statement", "import_from_statement"},
-            "declaration": {
-                "function_definition",
-                "class_definition",
-                "assignment",
-                "decorated_definition",
-            },
-        },
-        "name_field": "name",
-    },
-    "java": {
-        "extensions": {".java"},
-        "language": Language(ts_java.language()),
-        "node_types": {
-            "function": {"method_declaration", "constructor_declaration"},
-            "class": {"class_declaration", "interface_declaration", "enum_declaration"},
-            "method": {"method_declaration"},
-            "import": {"import_declaration", "package_declaration"},
-            "declaration": {
-                "class_declaration",
-                "interface_declaration",
-                "enum_declaration",
-            },
-        },
-        "name_field": "name",
-    },
-    "go": {
-        "extensions": {".go"},
-        "language": Language(ts_go.language()),
-        "node_types": {
-            "function": {"function_declaration", "method_declaration"},
-            "class": {"type_declaration"},
-            "method": {"method_declaration"},
-            "import": {"import_declaration"},
-            "declaration": {
-                "function_declaration",
-                "method_declaration",
-                "type_declaration",
-                "var_declaration",
-                "const_declaration",
-            },
-        },
-        "name_field": "name",
-    },
-    "rust": {
-        "extensions": {".rs"},
-        "language": Language(ts_rust.language()),
-        "node_types": {
-            "function": {"function_item"},
-            "class": {"struct_item", "enum_item", "impl_item", "trait_item"},
-            "method": {"function_item"},  # methods inside impl blocks
-            "import": {"use_declaration"},
-            "declaration": {
-                "function_item",
-                "struct_item",
-                "enum_item",
-                "impl_item",
-                "trait_item",
-                "const_item",
-                "static_item",
-                "type_item",
-                "mod_item",
-            },
-        },
-        "name_field": "name",
-    },
-    "sql": {
-        "extensions": {".sql"},
-        "language": Language(ts_sql.language()),
-        "node_types": {
-            "statement": {
-                "statement",  # Container for all statements
-                "create_table",
-                "create_index",
-                "create_view",
-                "create_function",
-                "create_procedure",
-                "create_trigger",
-                "alter_table",
-                "select",
-                "insert",
-                "update",
-                "delete",
-            },
-            "declaration": {
-                "create_table",
-                "create_index",
-                "create_view",
-                "create_function",
-                "create_procedure",
-            },
-        },
-        "name_field": "name",
-        "chunk_strategy": "statement",
-    },
-    "markdown": {
-        "extensions": {".md", ".mdx"},
-        "language": Language(ts_markdown.language()),
-        "node_types": {
-            "section": {"section", "atx_heading"},
-            "block": {"paragraph", "code_block", "fenced_code_block", "list"},
-        },
-        "name_field": None,
-        "chunk_strategy": "section",
-    },
-    "json": {
-        "extensions": {".json"},
-        "language": Language(ts_json.language()),
-        "node_types": {},
-        "name_field": None,
-        "chunk_strategy": "file_only",
-    },
-    "yaml": {
-        "extensions": {".yml", ".yaml"},
-        "language": Language(ts_yaml.language()),
-        "node_types": {
-            "block": {"block_mapping", "block_sequence"},
-        },
-        "name_field": None,
-        "chunk_strategy": "file_only",
-    },
-    "toml": {
-        "extensions": {".toml"},
-        "language": Language(ts_toml.language()),
-        "node_types": {
-            "section": {"table", "table_array_element"},
-        },
-        "name_field": None,
-        "chunk_strategy": "file_only",
-    },
-    "css": {
-        "extensions": {".css", ".scss", ".less"},
-        "language": Language(ts_css.language()),
-        "node_types": {
-            "rule": {"rule_set", "media_statement", "keyframes_statement"},
-        },
-        "name_field": None,
-        "chunk_strategy": "file_only",
-    },
-    "html": {
-        "extensions": {".html", ".htm"},
-        "language": Language(ts_html.language()),
-        "node_types": {
-            "element": {"element", "script_element", "style_element"},
-        },
-        "name_field": None,
-        "chunk_strategy": "file_only",
-    },
-}
-
-
-def detect_language(filepath: str) -> str | None:
-    """Detect language from file extension."""
-    ext = Path(filepath).suffix.lower()
-    for lang, config in LANGUAGE_CONFIG.items():
-        if ext in config["extensions"]:
-            return lang
-    return None
 
 
 class CodeParser:
     """Multi-language hierarchical code parser using tree-sitter.
 
     Extracts chunks at multiple levels depending on language:
-    - Code files: file → declaration → function/method
-    - SQL: file → statement
-    - Markdown: file → section
+    - Code files: file -> declaration -> function/method
+    - SQL: file -> statement
+    - Markdown: file -> section
     - Config files: file only
     """
 
@@ -336,7 +69,8 @@ class CodeParser:
             content = Path(filepath).read_text(encoding="utf-8")
 
         parser = self._get_parser(language)
-        tree = parser.parse(content.encode("utf-8"))
+        source_bytes = content.encode("utf-8")
+        tree = parser.parse(source_bytes)
 
         config = LANGUAGE_CONFIG[language]
         strategy = config.get("chunk_strategy", "code")
@@ -347,7 +81,7 @@ class CodeParser:
         imports = []
         if "import" in config.get("node_types", {}):
             imports = self._collect_imports(
-                tree.root_node, content, config["node_types"].get("import", set())
+                tree.root_node, source_bytes, config["node_types"].get("import", set())
             )
 
         # Track whether this is a small file (used for file-chunk preference rules)
@@ -363,20 +97,20 @@ class CodeParser:
         if strategy == "code":
             # Level 2: Declaration-level chunks
             declaration_chunks = self._extract_declarations(
-                tree.root_node, content, language, filepath, imports
+                tree.root_node, source_bytes, language, filepath, imports
             )
             chunks.extend(declaration_chunks)
 
             # Level 3: Function/method-level chunks
             function_chunks = self._extract_functions(
-                tree.root_node, content, language, filepath, imports
+                tree.root_node, source_bytes, language, filepath, imports
             )
             chunks.extend(function_chunks)
 
         elif strategy == "statement":
             # SQL: Extract statements
             statement_chunks = self._extract_statements(
-                tree.root_node, content, language, filepath
+                tree.root_node, source_bytes, language, filepath
             )
             chunks.extend(statement_chunks)
 
@@ -461,7 +195,7 @@ class CodeParser:
     def _extract_declarations(
         self,
         root: Node,
-        source: str,
+        source: bytes,
         language: str,
         filepath: str,
         imports: list[str],
@@ -479,8 +213,8 @@ class CodeParser:
             if child.type not in declaration_types:
                 continue
 
-            name = self._get_declaration_name(child, config.get("name_field"), source)
-            text = source[child.start_byte:child.end_byte]
+            name = self._get_declaration_name(child, config.get("name_field"))
+            text = source[child.start_byte:child.end_byte].decode("utf-8")
 
             if not text.strip():
                 continue
@@ -499,7 +233,7 @@ class CodeParser:
 
         return chunks
 
-    def _get_declaration_name(self, node: Node, name_field: str | None, source: str) -> str | None:
+    def _get_declaration_name(self, node: Node, name_field: str | None) -> str | None:
         """Extract name from a declaration node."""
         if not name_field:
             return None
@@ -540,7 +274,7 @@ class CodeParser:
     def _extract_functions(
         self,
         root: Node,
-        source: str,
+        source: bytes,
         language: str,
         filepath: str,
         imports: list[str],
@@ -614,7 +348,7 @@ class CodeParser:
     def _extract_statements(
         self,
         root: Node,
-        source: str,
+        source: bytes,
         language: str,
         filepath: str,
     ) -> list[ParsedChunk]:
@@ -628,7 +362,7 @@ class CodeParser:
             if node.type == "statement":
                 for child in node.children:
                     if child.type in statement_types:
-                        text = source[child.start_byte:child.end_byte]
+                        text = source[child.start_byte:child.end_byte].decode("utf-8")
                         if text.strip():
                             name = self._extract_sql_name(child, source)
                             chunks.append(ParsedChunk(
@@ -647,16 +381,16 @@ class CodeParser:
         visit(root)
         return chunks
 
-    def _extract_sql_name(self, node: Node, source: str) -> str | None:
+    def _extract_sql_name(self, node: Node, source: bytes) -> str | None:
         """Extract name from SQL statement (table name, etc.)."""
         # Look for identifier after CREATE TABLE, CREATE INDEX, etc.
         for child in node.children:
             if child.type in {"identifier", "table_reference", "object_reference"}:
-                return source[child.start_byte:child.end_byte]
+                return source[child.start_byte:child.end_byte].decode("utf-8")
             # Recurse one level for nested identifiers
             for subchild in child.children:
                 if subchild.type == "identifier":
-                    return source[subchild.start_byte:subchild.end_byte]
+                    return source[subchild.start_byte:subchild.end_byte].decode("utf-8")
         return None
 
     def _extract_sections(
@@ -711,14 +445,14 @@ class CodeParser:
         return chunks
 
     def _collect_imports(
-        self, root: Node, source: str, import_types: set[str]
+        self, root: Node, source: bytes, import_types: set[str]
     ) -> list[str]:
         """Collect import statements from the file."""
         imports = []
 
         def visit(node: Node):
             if node.type in import_types:
-                text = source[node.start_byte : node.end_byte].strip()
+                text = source[node.start_byte : node.end_byte].decode("utf-8").strip()
                 imports.append(text)
             for child in node.children:
                 visit(child)
@@ -764,7 +498,7 @@ class CodeParser:
     def _node_to_chunk(
         self,
         node: Node,
-        source: str,
+        source: bytes,
         chunk_type: str,
         symbol_name: str | None,
         filepath: str,
@@ -772,7 +506,7 @@ class CodeParser:
         parent_class: str | None = None,
     ) -> ParsedChunk | None:
         """Convert a tree-sitter node to a ParsedChunk."""
-        text = source[node.start_byte : node.end_byte]
+        text = source[node.start_byte : node.end_byte].decode("utf-8")
         if not text.strip():
             return None
 
@@ -790,7 +524,7 @@ class CodeParser:
         if chunk_type in ("function", "method"):
             body = node.child_by_field_name("body")
             if body:
-                sig = source[node.start_byte : body.start_byte].strip()
+                sig = source[node.start_byte : body.start_byte].decode("utf-8").strip()
                 if sig:
                     context["signature"] = sig
 
@@ -843,8 +577,8 @@ class CodeParser:
         if not children:
             return self._split_by_lines(chunk, max_tokens)
 
-        # Extract the source text that corresponds to this chunk
-        source = chunk.text
+        # Extract the source bytes that corresponds to this chunk
+        source = chunk.text.encode("utf-8")
         source_offset = chunk._node.start_byte if chunk._node else 0
 
         groups = self._group_children_by_budget(
@@ -865,7 +599,7 @@ class CodeParser:
         self,
         children: list[Node],
         source_offset: int,
-        source: str,
+        source: bytes,
         parent_chunk: ParsedChunk,
         max_tokens: int,
     ) -> list[ParsedChunk]:
@@ -875,7 +609,7 @@ class CodeParser:
         current_tokens = 0
 
         for child in children:
-            child_text = source[child.start_byte - source_offset : child.end_byte - source_offset]
+            child_text = source[child.start_byte - source_offset : child.end_byte - source_offset].decode("utf-8")
             child_tokens = len(_encoder.encode(child_text))
 
             if current_nodes and current_tokens + child_tokens > max_tokens:
@@ -903,7 +637,7 @@ class CodeParser:
         self,
         nodes: list[Node],
         source_offset: int,
-        source: str,
+        source: bytes,
         parent_chunk: ParsedChunk,
         token_count: int,
     ) -> ParsedChunk | None:
@@ -913,7 +647,7 @@ class CodeParser:
 
         start_byte = nodes[0].start_byte - source_offset
         end_byte = nodes[-1].end_byte - source_offset
-        text = source[start_byte:end_byte]
+        text = source[start_byte:end_byte].decode("utf-8")
 
         if not text.strip():
             return None
@@ -1018,14 +752,3 @@ class CodeParser:
             )
 
         return result
-
-
-def compute_file_hash(content: str) -> str:
-    """Compute BLAKE3 hash of file content."""
-    return blake3.blake3(content.encode("utf-8")).hexdigest()
-
-
-def compute_chunk_hash(text: str, filepath: str, start_line: int) -> str:
-    """Compute hash for a chunk (for deduplication)."""
-    data = f"{filepath}:{start_line}:{text}"
-    return blake3.blake3(data.encode("utf-8")).hexdigest()[:32]
