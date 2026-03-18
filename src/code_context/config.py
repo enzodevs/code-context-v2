@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     small_file_lines: int = 200  # Below this: prefer symbol chunks, drop generic file chunk
     global_watcher_initial_sync_concurrency: int = 1  # Limits parallel initial sync in watch-all
 
+    # file_only languages (JSON, YAML, etc.): skip if above this many lines
+    # Hand-written configs are small; auto-generated caches are huge
+    file_only_max_lines: int = 200
+
     # AST-aware splitting (Phase A)
     ast_split_enabled: bool = True  # False = fallback to token-only split
 

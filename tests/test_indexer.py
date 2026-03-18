@@ -279,6 +279,65 @@ class TestCollectFiles:
 
 
 # ---------------------------------------------------------------------------
+# file_only large file skipping
+# ---------------------------------------------------------------------------
+
+class TestFileOnlySkipping:
+    """Auto-generated JSON/YAML caches should be skipped, hand-written configs kept."""
+
+    def test_small_json_kept(self, parser):
+        """A small tsconfig.json should produce a file chunk."""
+        content = '{\n  "compilerOptions": {\n    "target": "ES2020",\n    "module": "commonjs"\n  }\n}'
+        chunks = parser.parse_file("tsconfig.json", content)
+        # May be empty if below min_tokens, but should not be skipped by line check
+        assert isinstance(chunks, list)
+
+    def test_large_json_skipped(self, parser, monkeypatch):
+        """A huge auto-generated JSON should be skipped entirely."""
+        from code_context.config import get_settings
+        settings = get_settings()
+        monkeypatch.setattr(settings, "file_only_max_lines", 200)
+
+        big_json = "{\n" + ",\n".join([f'  "key_{i}": {i}' for i in range(500)]) + "\n}"
+        chunks = parser.parse_file("tsconfig.tsbuildinfo", big_json)
+        assert chunks == []
+
+    def test_large_yaml_skipped(self, parser, monkeypatch):
+        from code_context.config import get_settings
+        settings = get_settings()
+        monkeypatch.setattr(settings, "file_only_max_lines", 200)
+
+        big_yaml = "\n".join([f"key_{i}: value_{i}" for i in range(500)])
+        chunks = parser.parse_file("generated.yaml", big_yaml)
+        assert chunks == []
+
+    def test_code_files_not_affected(self, parser, monkeypatch):
+        """The line cap should NOT apply to code files (only file_only strategy)."""
+        from code_context.config import get_settings
+        settings = get_settings()
+        monkeypatch.setattr(settings, "file_only_max_lines", 50)
+
+        # A 300-line Python file should still parse normally
+        big_py = "\n".join([f"x_{i} = {i}" for i in range(300)])
+        chunks = parser.parse_file("big.py", big_py)
+        assert len(chunks) >= 1
+
+    def test_sql_not_affected(self, parser, monkeypatch):
+        """SQL (statement strategy) should not be affected by file_only cap."""
+        from code_context.config import get_settings
+        settings = get_settings()
+        monkeypatch.setattr(settings, "file_only_max_lines", 50)
+
+        big_sql = "\n\n".join(
+            f"CREATE OR REPLACE FUNCTION fn_{i}(p_id BIGINT)\n"
+            f"RETURNS VOID AS $$\nBEGIN\n    RETURN;\nEND;\n$$ LANGUAGE plpgsql;"
+            for i in range(20)
+        )
+        chunks = parser.parse_file("big.sql", big_sql)
+        assert len(chunks) >= 1
+
+
+# ---------------------------------------------------------------------------
 # Parser edge cases — silent data loss scenarios
 # ---------------------------------------------------------------------------
 

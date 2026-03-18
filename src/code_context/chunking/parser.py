@@ -88,6 +88,11 @@ class CodeParser:
         line_count = content.count("\n") + 1
         is_small_file = line_count <= self.settings.small_file_lines
 
+        # Skip large file_only files (auto-generated JSON caches, lock files, etc.)
+        if strategy == "file_only" and line_count > self.settings.file_only_max_lines:
+            logger.info(f"Skipping file_only file ({line_count} lines > {self.settings.file_only_max_lines}): {filepath}")
+            return []
+
         # Level 1: File-level chunk (complete file)
         file_chunk = self._create_file_chunk(filepath, content, imports, tree.root_node)
         if file_chunk:
