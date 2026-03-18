@@ -115,10 +115,15 @@ class VoyageClient:
                     logger.error(f"{label} error (attempt {attempt}/{self.retry_max_attempts}): {e}")
                     raise
 
-                backoff_ms = min(
-                    self.retry_max_delay_ms,
-                    self.retry_base_delay_ms * (2 ** (attempt - 1)),
-                )
+                # TPM rate limits need longer waits than transient errors
+                is_tpm = "tokens per minute" in str(e).lower() or "tpm" in str(e).lower()
+                if is_tpm:
+                    backoff_ms = 30_000  # 30s — wait for the minute window to roll
+                else:
+                    backoff_ms = min(
+                        self.retry_max_delay_ms,
+                        self.retry_base_delay_ms * (2 ** (attempt - 1)),
+                    )
                 jitter_ms = random.randint(0, self.retry_jitter_ms) if self.retry_jitter_ms else 0
                 sleep_ms = backoff_ms + jitter_ms
                 logger.warning(

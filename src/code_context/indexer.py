@@ -70,10 +70,28 @@ DEFAULT_IGNORE_PATTERNS = {
     ".reports",
     "test-results",
     "playwright-report",
+    # Database backups, generated schemas, seed data
+    "backup-version",
+    "reverse-database",
+    "seedRecords",
+    # Backlogs, archives, backups
+    "__backlog__",
+    "_archive",
+    "archive",
+    "bkp_",
+    # Spec/config tooling
+    ".specify",
+    # Drizzle migration output
+    "drizzle",
+    # Credentials / secrets directories
+    "chaves",
+    "secrets",
+    "credentials",
     # Files
     "package-lock.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "bun.lock",
     "poetry.lock",
     "Cargo.lock",
     ".DS_Store",
@@ -90,6 +108,9 @@ IGNORE_FILE_PATTERNS = {
     ".chunk.js",
     # Source maps
     ".map",
+    # Auto-generated type declarations
+    "worker-configuration.d.ts",
+    "-env.d.ts",
 }
 
 
